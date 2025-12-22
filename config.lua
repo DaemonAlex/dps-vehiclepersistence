@@ -28,8 +28,9 @@ Config.PersistTypes = {
     'trailer'
 }
 
--- Vehicles that should NOT persist (emergency vehicles, rentals, etc.)
+-- Vehicles that should NOT persist (emergency vehicles, rentals, job vehicles, etc.)
 Config.BlacklistedModels = {
+    -- Emergency vehicles
     'police',
     'police2',
     'police3',
@@ -46,7 +47,24 @@ Config.BlacklistedModels = {
     'firetruk',
     'lguard',
     'pbus',
-    'pranger'
+    'pranger',
+    -- Job boats (ocean-delivery)
+    'dinghy',
+    'dinghy2',
+    'dinghy3',
+    'dinghy4',
+    'jetmax',
+    'marquis',
+    'toro',
+    'toro2',
+    'tropic',
+    'tropic2',
+    -- Job vehicles (forklifts, etc.)
+    'forklift',
+    'mower',
+    'tractor',
+    'tractor2',
+    'tractor3'
 }
 
 -- Jobs whose vehicles should not persist (they use job garages)
