@@ -6,6 +6,98 @@ local worldVehicles = {}  -- Track vehicles in the world
 local playerVehicles = {} -- Track which vehicles belong to which player
 local vehiclePropsQueue = {} -- Queue for vehicles needing props applied
 
+-- Forward declarations for state bag functions
+local SetVehicleStateBag, ClearVehicleStateBag
+
+-- ============================================
+-- VERSION CHECKER
+-- ============================================
+local currentVersion = GetResourceMetadata(GetCurrentResourceName(), 'version', 0) or '1.0.0'
+local githubRepo = 'DaemonAlex/dps-vehiclepersistence'
+local updateAvailable = false
+local latestVersionCached = nil
+
+-- Semantic version comparison (returns true if latest > current)
+local function CompareVersions(current, latest)
+    if not current or not latest then return false end
+
+    local function parseVersion(v)
+        local major, minor, patch = v:match("(%d+)%.(%d+)%.?(%d*)")
+        return {
+            tonumber(major) or 0,
+            tonumber(minor) or 0,
+            tonumber(patch) or 0
+        }
+    end
+
+    local c = parseVersion(current)
+    local l = parseVersion(latest)
+
+    for i = 1, 3 do
+        if l[i] > c[i] then return true end
+        if l[i] < c[i] then return false end
+    end
+    return false
+end
+
+-- Check for updates from GitHub
+local function CheckVersion()
+    local url = ('https://raw.githubusercontent.com/%s/main/fxmanifest.lua'):format(githubRepo)
+
+    PerformHttpRequest(url, function(statusCode, response, headers)
+        if statusCode ~= 200 then
+            if Config.Debug then
+                print('^1[dps-vehiclepersistence] Version check failed: HTTP ' .. tostring(statusCode))
+            end
+            return
+        end
+
+        local latestVersion = response:match("version ['\"]([%d%.]+)")
+        if not latestVersion then
+            if Config.Debug then
+                print('^1[dps-vehiclepersistence] Could not parse version from GitHub')
+            end
+            return
+        end
+
+        latestVersionCached = latestVersion
+
+        if CompareVersions(currentVersion, latestVersion) then
+            updateAvailable = true
+            print('^3━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+            print('^3[dps-vehiclepersistence] Update Available!')
+            print('^7Current: v' .. currentVersion .. ' → Latest: ^2v' .. latestVersion)
+            print('^7Download: https://github.com/' .. githubRepo .. '/releases')
+            print('^3━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+        else
+            print('^2[dps-vehiclepersistence] Running latest version: v' .. currentVersion)
+        end
+    end, 'GET')
+end
+
+-- Notify admins when they join if update is available
+AddEventHandler('QBCore:Server:PlayerLoaded', function(Player)
+    if updateAvailable and latestVersionCached then
+        -- Check if player has admin permissions
+        local src = Player.PlayerData.source
+        if IsPlayerAceAllowed(src, 'command') then
+            Wait(5000) -- Delay to ensure client is ready
+            TriggerClientEvent('ox_lib:notify', src, {
+                title = 'dps-vehiclepersistence',
+                description = 'Update available: v' .. currentVersion .. ' → v' .. latestVersionCached,
+                type = 'warning',
+                duration = 10000
+            })
+        end
+    end
+end)
+
+-- Run version check on resource start (zero resmon impact)
+CreateThread(function()
+    Wait(5000) -- Wait for server to be ready
+    CheckVersion()
+end)
+
 -- Callback to check if player owns a vehicle
 lib.callback.register('dps-vehiclepersistence:checkOwnership', function(source, plate)
     local Player = QBCore.Functions.GetPlayer(source)
@@ -169,7 +261,7 @@ function SpawnPersistedVehicles()
 
                 -- Track this vehicle
                 local netId = NetworkGetNetworkIdFromEntity(vehicle)
-                worldVehicles[veh.plate] = {
+                local vehicleData = {
                     netId = netId,
                     entity = vehicle,
                     citizenid = veh.citizenid,
@@ -181,6 +273,10 @@ function SpawnPersistedVehicles()
                     props = props,
                     needsProps = true
                 }
+                worldVehicles[veh.plate] = vehicleData
+
+                -- Set state bag for this vehicle
+                SetVehicleStateBag(vehicle, vehicleData)
 
                 -- Queue for props application when a player gets near
                 vehiclePropsQueue[veh.plate] = {
@@ -441,21 +537,163 @@ AddEventHandler('txAdmin:events:serverShuttingDown', function()
     print('^2[dps-vehiclepersistence] Saved ' .. saved .. ' vehicles before shutdown')
 end)
 
--- Periodic cleanup of orphaned vehicles (vehicles whose owners haven't logged in for X days)
+-- ============================================
+-- ORPHANED VEHICLE CLEANUP / IMPOUND MIGRATION
+-- ============================================
+
+-- Calculate impound fee based on orphan age
+local function CalculateImpoundFee(savedAt)
+    if not Config.OrphanedVehicles or Config.OrphanedVehicles.feePerDay == 0 then
+        return 0
+    end
+
+    local now = os.time()
+    local savedTime = savedAt or now
+    local daysOrphaned = math.floor((now - savedTime) / 86400)
+    local fee = daysOrphaned * Config.OrphanedVehicles.feePerDay
+
+    return math.min(fee, Config.OrphanedVehicles.maxFee or 1500)
+end
+
+-- Migrate orphaned vehicle to impound
+local function MigrateToImpound(vehicleData)
+    if not vehicleData or not vehicleData.plate then return false end
+
+    local impoundLot = Config.OrphanedVehicles and Config.OrphanedVehicles.impoundLot or 'impound'
+    local depotPrice = CalculateImpoundFee(vehicleData.savedAt)
+
+    -- Update player_vehicles to set state = 2 (impounded) with depot info
+    local result = MySQL.update.await([[
+        UPDATE player_vehicles
+        SET state = 2, garage = ?, depotprice = ?
+        WHERE plate = ?
+    ]], { impoundLot, depotPrice, vehicleData.plate })
+
+    if result and result > 0 then
+        -- Remove from world vehicles table
+        MySQL.query('DELETE FROM dps_world_vehicles WHERE plate = ?', { vehicleData.plate })
+        worldVehicles[vehicleData.plate] = nil
+
+        if Config.Debug then
+            print('^3[dps-vehiclepersistence] Impounded orphaned vehicle: ' .. vehicleData.plate .. ' (Fee: $' .. depotPrice .. ')')
+        end
+        return true
+    end
+
+    return false
+end
+
+-- Periodic cleanup of orphaned vehicles (migrate to impound or delete)
 CreateThread(function()
+    local intervalMs = ((Config.OrphanedVehicles and Config.OrphanedVehicles.cleanupInterval) or 30) * 60000
+
     while true do
-        Wait(1800000) -- Every 30 minutes
+        Wait(intervalMs)
 
-        -- Clean up vehicles older than 7 days whose owners haven't been online
-        local deleted = MySQL.query.await([[
-            DELETE wv FROM dps_world_vehicles wv
+        local thresholdDays = (Config.OrphanedVehicles and Config.OrphanedVehicles.orphanThresholdDays) or 7
+        local action = (Config.OrphanedVehicles and Config.OrphanedVehicles.action) or 'impound'
+
+        -- Find orphaned vehicles
+        local orphaned = MySQL.query.await([[
+            SELECT wv.*, UNIX_TIMESTAMP(wv.saved_at) as saved_timestamp
+            FROM dps_world_vehicles wv
             LEFT JOIN players p ON wv.citizenid = p.citizenid
-            WHERE wv.saved_at < DATE_SUB(NOW(), INTERVAL 7 DAY)
-            AND (p.last_updated IS NULL OR p.last_updated < DATE_SUB(NOW(), INTERVAL 7 DAY))
-        ]])
+            WHERE wv.saved_at < DATE_SUB(NOW(), INTERVAL ? DAY)
+            AND (p.last_updated IS NULL OR p.last_updated < DATE_SUB(NOW(), INTERVAL ? DAY))
+        ]], { thresholdDays, thresholdDays })
 
-        if Config.Debug and deleted and deleted.affectedRows > 0 then
-            print('^3[dps-vehiclepersistence] Cleaned up ' .. deleted.affectedRows .. ' orphaned vehicles')
+        if orphaned and #orphaned > 0 then
+            local processed = 0
+
+            for _, veh in ipairs(orphaned) do
+                if action == 'impound' then
+                    -- Migrate to impound lot
+                    local vehicleData = {
+                        plate = veh.plate,
+                        citizenid = veh.citizenid,
+                        savedAt = veh.saved_timestamp
+                    }
+                    if MigrateToImpound(vehicleData) then
+                        processed = processed + 1
+                    end
+                else
+                    -- Just delete
+                    MySQL.query('DELETE FROM dps_world_vehicles WHERE plate = ?', { veh.plate })
+                    worldVehicles[veh.plate] = nil
+                    processed = processed + 1
+                end
+            end
+
+            if processed > 0 then
+                local actionLabel = action == 'impound' and 'impounded' or 'deleted'
+                print('^3[dps-vehiclepersistence] ' .. string.upper(actionLabel) .. ' ' .. processed .. ' orphaned vehicles')
+            end
+        end
+    end
+end)
+
+-- ============================================
+-- STATE BAG SYNCING
+-- Reduces network events by using FiveM's state bag system
+-- ============================================
+
+-- Set vehicle state bag with persistence data
+SetVehicleStateBag = function(entity, vehicleData)
+    if not entity or not DoesEntityExist(entity) then return end
+
+    local state = Entity(entity).state
+
+    -- Core persistence data (minimal, frequently accessed)
+    state:set('dps:persisted', true, true)
+    state:set('dps:owner', vehicleData.citizenid, true)
+    state:set('dps:plate', vehicleData.plate, true)
+
+    -- Optional detailed data (set but not replicated frequently)
+    if vehicleData.fuel then
+        state:set('dps:fuel', vehicleData.fuel, false)
+    end
+    if vehicleData.body then
+        state:set('dps:body', vehicleData.body, false)
+    end
+    if vehicleData.engine then
+        state:set('dps:engine', vehicleData.engine, false)
+    end
+
+    if Config.Debug then
+        print('^2[dps-vehiclepersistence] State bag set for: ' .. vehicleData.plate)
+    end
+end
+
+-- Clear vehicle state bag when removed from persistence
+ClearVehicleStateBag = function(entity)
+    if not entity or not DoesEntityExist(entity) then return end
+
+    local state = Entity(entity).state
+    state:set('dps:persisted', nil, true)
+    state:set('dps:owner', nil, true)
+    state:set('dps:plate', nil, true)
+    state:set('dps:fuel', nil, false)
+    state:set('dps:body', nil, false)
+    state:set('dps:engine', nil, false)
+end
+
+-- Listen for state bag changes from client (damage updates)
+AddStateBagChangeHandler('dps:damage', nil, function(bagName, key, value, reserved, replicated)
+    if replicated then return end -- Ignore if already replicated
+
+    local entity = GetEntityFromStateBagName(bagName)
+    if not entity or entity == 0 then return end
+
+    local plate = GetVehicleNumberPlateText(entity)
+    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+
+    if worldVehicles[plate] and value then
+        -- Update tracked damage values
+        worldVehicles[plate].body = value.body
+        worldVehicles[plate].engine = value.engine
+
+        if Config.Debug then
+            print('^3[dps-vehiclepersistence] Damage updated via state bag: ' .. plate)
         end
     end
 end)

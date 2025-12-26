@@ -6,6 +6,59 @@ local currentVehicle = nil
 local lastVehicle = nil
 local isOwner = false
 
+-- Tiered throttling system
+local ThrottleTiers = {
+    DRIVING = 100,      -- In vehicle or <10m from owned vehicle
+    NEARBY = 500,       -- 10-20m from owned vehicle
+    WALKING = 2000,     -- 20-100m from any tracked vehicle
+    DISTANT = 5000      -- >100m from all tracked vehicles
+}
+
+-- Get dynamic wait interval based on player state
+local function GetThrottleInterval()
+    local ped = PlayerPedId()
+    local playerCoords = GetEntityCoords(ped)
+
+    -- If driving, use fastest interval
+    if currentVehicle and currentVehicle ~= 0 then
+        return ThrottleTiers.DRIVING
+    end
+
+    -- Check distance to last vehicle (just exited)
+    if lastVehicle and DoesEntityExist(lastVehicle) then
+        local vehCoords = GetEntityCoords(lastVehicle)
+        local dist = #(playerCoords - vehCoords)
+
+        if dist < 10.0 then
+            return ThrottleTiers.DRIVING
+        elseif dist < 20.0 then
+            return ThrottleTiers.NEARBY
+        end
+    end
+
+    -- Check for any nearby vehicles in game pool
+    local vehicles = GetGamePool('CVehicle')
+    local closestDist = 999.0
+
+    for _, vehicle in ipairs(vehicles) do
+        if DoesEntityExist(vehicle) then
+            local vehCoords = GetEntityCoords(vehicle)
+            local dist = #(playerCoords - vehCoords)
+            if dist < closestDist then
+                closestDist = dist
+            end
+        end
+    end
+
+    if closestDist < 20.0 then
+        return ThrottleTiers.NEARBY
+    elseif closestDist < 100.0 then
+        return ThrottleTiers.WALKING
+    end
+
+    return ThrottleTiers.DISTANT
+end
+
 -- Get vehicle properties using ox_lib
 local function GetVehicleProperties(vehicle)
     if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then
@@ -61,10 +114,33 @@ local function HasVehicleKeys(plate)
     return success and result
 end
 
--- Thread to detect vehicle entry/exit
+-- ============================================
+-- GARAGE SPAWN TRACKING (forward declarations)
+-- ============================================
+local garageSpawnedVehicles = {}
+local GARAGE_SPAWN_GRACE_PERIOD = 5000 -- 5 seconds
+
+-- Check if vehicle was recently spawned from garage (skip persistence save)
+local function IsGarageSpawned(vehicle)
+    if not vehicle or not DoesEntityExist(vehicle) then return false end
+    local netId = NetworkGetNetworkIdFromEntity(vehicle)
+    local data = garageSpawnedVehicles[netId]
+    if data then
+        if GetGameTimer() - data.spawnTime < GARAGE_SPAWN_GRACE_PERIOD then
+            return true
+        else
+            -- Grace period expired, remove from tracking
+            garageSpawnedVehicles[netId] = nil
+        end
+    end
+    return false
+end
+
+-- Thread to detect vehicle entry/exit (with tiered throttling)
 CreateThread(function()
     while true do
-        Wait(500)
+        local interval = GetThrottleInterval()
+        Wait(interval)
 
         local ped = PlayerPedId()
         local vehicle = GetVehiclePedIsIn(ped, false)
@@ -93,7 +169,15 @@ CreateThread(function()
             -- Exited a vehicle
             local exitedVehicle = lastVehicle
 
-            if exitedVehicle and DoesEntityExist(exitedVehicle) and isOwner then
+            -- Skip if vehicle was just spawned from garage (grace period)
+            if exitedVehicle and IsGarageSpawned(exitedVehicle) then
+                if Config.Debug then
+                    print('[dps-vehiclepersistence] Skipping save - vehicle recently spawned from garage')
+                end
+                currentVehicle = nil
+                isOwner = false
+                -- Continue to next iteration
+            elseif exitedVehicle and DoesEntityExist(exitedVehicle) and isOwner then
                 -- Get vehicle data
                 local plate = GetVehicleNumberPlateText(exitedVehicle)
                 plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
@@ -226,21 +310,99 @@ RegisterNetEvent('dps-vehiclepersistence:applyProps', function(netId, props, fue
     end
 end)
 
--- Listen for garage storage events
+-- ============================================
+-- EVENT-BASED GARAGE INTEGRATION
+-- Pure event-driven approach - no polling
+-- ============================================
+
+-- Helper to notify server of garage storage
+local function NotifyVehicleStored(plate)
+    if plate and plate ~= '' then
+        plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+        TriggerServerEvent('dps-vehiclepersistence:vehicleStored', plate)
+        -- Clear from props cache so it can be re-requested if spawned again
+        propsRequested[plate] = nil
+        if Config.Debug then
+            print('[dps-vehiclepersistence] Vehicle stored in garage: ' .. plate)
+        end
+    end
+end
+
+-- Helper to mark vehicle as garage-spawned
+local function MarkGarageSpawned(vehicle, plate)
+    if vehicle and DoesEntityExist(vehicle) then
+        local netId = NetworkGetNetworkIdFromEntity(vehicle)
+        garageSpawnedVehicles[netId] = {
+            plate = plate,
+            spawnTime = GetGameTimer()
+        }
+        if Config.Debug then
+            print('[dps-vehiclepersistence] Vehicle spawned from garage: ' .. plate)
+        end
+    end
+end
+
+-- QB-Garage events
 RegisterNetEvent('qb-garage:client:vehicleStore', function()
-    -- Vehicle is being stored in garage
     local vehicle = GetVehiclePedIsIn(PlayerPedId(), false)
     if vehicle and vehicle ~= 0 then
         local plate = GetVehicleNumberPlateText(vehicle)
-        plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
-        TriggerServerEvent('dps-vehiclepersistence:vehicleStored', plate)
+        NotifyVehicleStored(plate)
     end
 end)
 
--- Listen for jg-advancedgarages storage
+RegisterNetEvent('qb-garage:client:TakeOutVehicle', function(vehicleInfo)
+    if vehicleInfo and vehicleInfo.plate then
+        -- Wait for vehicle to spawn
+        Wait(500)
+        local vehicles = GetGamePool('CVehicle')
+        for _, veh in ipairs(vehicles) do
+            local plate = GetVehicleNumberPlateText(veh)
+            plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+            if plate == vehicleInfo.plate then
+                MarkGarageSpawned(veh, plate)
+                break
+            end
+        end
+    end
+end)
+
+-- JG-AdvancedGarages events
 RegisterNetEvent('jg-advancedgarages:client:VehicleStored', function(data)
     if data and data.plate then
-        TriggerServerEvent('dps-vehiclepersistence:vehicleStored', data.plate)
+        NotifyVehicleStored(data.plate)
+    end
+end)
+
+RegisterNetEvent('jg-advancedgarages:client:vehicleSpawned', function(vehicle, plate)
+    MarkGarageSpawned(vehicle, plate)
+end)
+
+-- CD-Garage events
+RegisterNetEvent('cd_garage:client:Stored', function(plate)
+    NotifyVehicleStored(plate)
+end)
+
+RegisterNetEvent('cd_garage:client:Spawned', function(vehicle, plate)
+    MarkGarageSpawned(vehicle, plate)
+end)
+
+-- Qs-Garage / Quasar events
+RegisterNetEvent('qs-advancedgarages:vehicleStored', function(data)
+    if data and data.plate then
+        NotifyVehicleStored(data.plate)
+    end
+end)
+
+RegisterNetEvent('qs-advancedgarages:vehicleSpawned', function(vehicle, plate)
+    MarkGarageSpawned(vehicle, plate)
+end)
+
+-- Generic vehicle delete/impound events
+RegisterNetEvent('vehiclekeys:client:SetOwner', function(plate)
+    -- New ownership established, likely from purchase or spawn
+    if plate then
+        propsRequested[plate] = nil
     end
 end)
 
@@ -280,33 +442,120 @@ end)
 -- Track vehicles we've already requested props for
 local propsRequested = {}
 
--- Thread to detect nearby persisted vehicles and request props
+-- Render distance thresholds for prop application
+local RenderDistances = {
+    IMMEDIATE = 30.0,   -- Apply props immediately when this close
+    STANDARD = 75.0,    -- Normal render distance
+    EXTENDED = 150.0    -- Extended check for high-density areas
+}
+
+-- Thread to detect nearby persisted vehicles and request props (render distance optimized)
 CreateThread(function()
     while true do
-        Wait(2000)
+        -- Use slower interval when no vehicles nearby
+        local interval = GetThrottleInterval()
+        -- Cap props check to max 2 seconds even when distant
+        Wait(math.min(interval, 2000))
 
         local ped = PlayerPedId()
         local coords = GetEntityCoords(ped)
 
+        -- Only process if player is on foot or moving slowly
+        local playerVehicle = GetVehiclePedIsIn(ped, false)
+        local checkDistance = RenderDistances.STANDARD
+
+        -- Extend check distance when in a vehicle (driving past parked cars)
+        if playerVehicle ~= 0 then
+            local speed = GetEntitySpeed(playerVehicle)
+            if speed > 20.0 then -- ~72 km/h
+                checkDistance = RenderDistances.EXTENDED
+            end
+        end
+
         local vehicles = GetGamePool('CVehicle')
+        local requestCount = 0
+        local maxRequestsPerTick = 3 -- Batch limit to prevent server spam
+
         for _, vehicle in ipairs(vehicles) do
+            if requestCount >= maxRequestsPerTick then break end
+
             if DoesEntityExist(vehicle) then
                 local vehCoords = GetEntityCoords(vehicle)
                 local dist = #(coords - vehCoords)
 
-                -- When within 50 units, request props if not already done
-                if dist < 50.0 then
+                -- Only request props within render distance
+                if dist < checkDistance then
                     local plate = GetVehicleNumberPlateText(vehicle)
                     plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
 
                     if plate and plate ~= '' and not propsRequested[plate] then
                         propsRequested[plate] = true
+                        requestCount = requestCount + 1
                         TriggerServerEvent('dps-vehiclepersistence:requestProps', plate)
 
                         if Config.Debug then
-                            print('[dps-vehiclepersistence] Requested props for: ' .. plate)
+                            print('[dps-vehiclepersistence] Requested props for: ' .. plate .. ' (dist: ' .. math.floor(dist) .. 'm)')
                         end
                     end
+                end
+            end
+        end
+    end
+end)
+
+-- ============================================
+-- STATE BAG INTEGRATION
+-- Read persistence data without server events
+-- ============================================
+
+-- Check if vehicle is persisted using state bag (faster than server callback)
+local function IsVehiclePersistedLocal(vehicle)
+    if not vehicle or not DoesEntityExist(vehicle) then return false end
+    local state = Entity(vehicle).state
+    return state['dps:persisted'] == true
+end
+
+-- Get vehicle owner from state bag
+local function GetVehicleOwnerLocal(vehicle)
+    if not vehicle or not DoesEntityExist(vehicle) then return nil end
+    local state = Entity(vehicle).state
+    return state['dps:owner']
+end
+
+-- Update vehicle damage via state bag (reduces server events)
+local function UpdateVehicleDamageStateBag(vehicle)
+    if not vehicle or not DoesEntityExist(vehicle) then return end
+    if not IsVehiclePersistedLocal(vehicle) then return end
+
+    local body = GetVehicleBodyHealth(vehicle)
+    local engine = GetVehicleEngineHealth(vehicle)
+
+    local state = Entity(vehicle).state
+    state:set('dps:damage', { body = body, engine = engine }, false)
+end
+
+-- Periodic damage sync for owned vehicles (uses state bags)
+CreateThread(function()
+    local lastDamageSync = {}
+
+    while true do
+        Wait(10000) -- Every 10 seconds
+
+        if currentVehicle and DoesEntityExist(currentVehicle) and isOwner then
+            local body = GetVehicleBodyHealth(currentVehicle)
+            local engine = GetVehicleEngineHealth(currentVehicle)
+
+            -- Only sync if damage changed significantly
+            local plate = GetVehicleNumberPlateText(currentVehicle)
+            plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+
+            local lastSync = lastDamageSync[plate]
+            if not lastSync or math.abs(lastSync.body - body) > 50 or math.abs(lastSync.engine - engine) > 50 then
+                UpdateVehicleDamageStateBag(currentVehicle)
+                lastDamageSync[plate] = { body = body, engine = engine }
+
+                if Config.Debug then
+                    print('[dps-vehiclepersistence] Damage synced via state bag: ' .. plate)
                 end
             end
         end

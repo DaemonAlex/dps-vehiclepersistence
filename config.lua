@@ -82,3 +82,27 @@ Config.SpawnDelay = 500
 
 -- Debug mode - prints vehicle persistence info
 Config.Debug = false
+
+-- ============================================
+-- ORPHAN VEHICLE HANDLING
+-- ============================================
+Config.OrphanedVehicles = {
+    -- Days before a world vehicle is considered orphaned
+    orphanThresholdDays = 7,
+
+    -- What to do with orphaned vehicles: 'impound' or 'delete'
+    action = 'impound',
+
+    -- If 'impound', which impound lot to send vehicles to
+    -- Uses player_vehicles.state = 2 (impounded) for QB-Core
+    impoundLot = 'impound',
+
+    -- Impound fee per orphan day (0 = no fee scaling)
+    feePerDay = 100,
+
+    -- Maximum impound fee
+    maxFee = 1500,
+
+    -- How often to run the cleanup (minutes)
+    cleanupInterval = 30
+}
