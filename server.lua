@@ -119,6 +119,12 @@ end)
 
 -- Initialize database table
 CreateThread(function()
+    -- Skip everything if persistence is disabled
+    if Config.Enabled == false then
+        print('^3[dps-vehiclepersistence] Persistence DISABLED - not loading vehicles')
+        return
+    end
+
     MySQL.query([[
         CREATE TABLE IF NOT EXISTS `dps_world_vehicles` (
             `id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -171,6 +177,35 @@ local function IsJobBlacklisted(citizenid)
     end
     return false
 end
+
+-- Check if player is staff (exempt from persistence)
+local function IsPlayerAdmin(source)
+    if not Config.AdminExempt then return false end
+    if not source then return false end
+
+    -- Check ACE permissions (txAdmin, vMenu, etc.)
+    if IsPlayerAceAllowed(source, 'command') then return true end
+    if IsPlayerAceAllowed(source, 'admin') then return true end
+
+    -- Check QBCore staff permissions (configurable in config.lua)
+    local Player = QBCore.Functions.GetPlayer(source)
+    if Player then
+        local group = Player.PlayerData.group or QBCore.Functions.GetPermission(source)
+        local staffGroups = Config.StaffGroups or { 'admin', 'god' }
+        for _, staffGroup in ipairs(staffGroups) do
+            if group == staffGroup then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+-- Callback for client to check admin status
+lib.callback.register('dps-vehiclepersistence:isAdmin', function(source)
+    return IsPlayerAdmin(source)
+end)
 
 -- Get vehicle properties from networked entity
 local function GetVehicleProps(netId)
@@ -321,7 +356,9 @@ end)
 
 -- Handle player entering a vehicle
 RegisterNetEvent('dps-vehiclepersistence:vehicleEntered', function(netId, plate, isOwner)
+    if Config.Enabled == false then return end
     local src = source
+    if IsPlayerAdmin(src) then return end -- Admin exempt
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return end
 
@@ -343,7 +380,9 @@ end)
 
 -- Handle player exiting a vehicle
 RegisterNetEvent('dps-vehiclepersistence:vehicleExited', function(vehicleData)
+    if Config.Enabled == false then return end
     local src = source
+    if IsPlayerAdmin(src) then return end -- Admin exempt
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return end
 
@@ -407,6 +446,7 @@ end)
 
 -- Handle vehicle stored in garage
 RegisterNetEvent('dps-vehiclepersistence:vehicleStored', function(plate)
+    if Config.Enabled == false then return end
     if worldVehicles[plate] then
         RemoveVehicleFromDB(plate)
         worldVehicles[plate] = nil
@@ -444,6 +484,7 @@ end)
 
 -- Handle vehicle destroyed/deleted
 RegisterNetEvent('dps-vehiclepersistence:vehicleDestroyed', function(plate)
+    if Config.Enabled == false then return end
     if worldVehicles[plate] then
         RemoveVehicleFromDB(plate)
         worldVehicles[plate] = nil
@@ -585,6 +626,9 @@ end
 
 -- Periodic cleanup of orphaned vehicles (migrate to impound or delete)
 CreateThread(function()
+    -- Skip if persistence is disabled
+    if Config.Enabled == false then return end
+
     local intervalMs = ((Config.OrphanedVehicles and Config.OrphanedVehicles.cleanupInterval) or 30) * 60000
 
     while true do
@@ -714,4 +758,65 @@ exports('RemovePersistedVehicle', function(plate)
         return true
     end
     return false
+end)
+
+-- ============================================
+-- JOB VEHICLE EXCLUSION (for dps-maritime, etc.)
+-- Other resources can mark vehicles as "job vehicles"
+-- to prevent persistence tracking
+-- ============================================
+
+local jobVehicles = {} -- [plate] = { resource, reason, timestamp }
+
+-- Mark a vehicle as a job vehicle (excluded from persistence)
+exports('ExcludeFromPersistence', function(plate, resource, reason)
+    if not plate then return false end
+
+    jobVehicles[plate] = {
+        resource = resource or 'unknown',
+        reason = reason or 'job vehicle',
+        timestamp = os.time()
+    }
+
+    -- Also remove if already tracked
+    if worldVehicles[plate] then
+        RemoveVehicleFromDB(plate)
+        worldVehicles[plate] = nil
+    end
+
+    if Config.Debug then
+        print('^3[dps-vehiclepersistence] Vehicle excluded by ' .. (resource or 'unknown') .. ': ' .. plate)
+    end
+
+    return true
+end)
+
+-- Remove exclusion (when job ends, vehicle returned to garage)
+exports('RemoveExclusion', function(plate)
+    if not plate then return false end
+
+    if jobVehicles[plate] then
+        jobVehicles[plate] = nil
+        if Config.Debug then
+            print('^2[dps-vehiclepersistence] Vehicle exclusion removed: ' .. plate)
+        end
+        return true
+    end
+
+    return false
+end)
+
+-- Check if a vehicle is excluded
+exports('IsExcludedFromPersistence', function(plate)
+    return jobVehicles[plate] ~= nil
+end)
+
+-- Event version for client-side use
+RegisterNetEvent('dps-vehiclepersistence:excludeVehicle', function(plate, reason)
+    local src = source
+    exports['dps-vehiclepersistence']:ExcludeFromPersistence(plate, GetInvokingResource() or 'client', reason)
+end)
+
+RegisterNetEvent('dps-vehiclepersistence:removeExclusion', function(plate)
+    exports['dps-vehiclepersistence']:RemoveExclusion(plate)
 end)

@@ -1,5 +1,15 @@
 Config = {}
 
+-- Master enable/disable toggle (set to false to completely disable persistence)
+Config.Enabled = true
+
+-- Exempt staff from vehicle persistence tracking (recommended for testing)
+Config.AdminExempt = true
+Config.StaffGroups = {
+    'admin', 'god', 'superadmin', 'mod', 'moderator',
+    'helper', 'staff', 'support', 'dev', 'developer'
+}
+
 -- How long a vehicle stays in the world after the owner disconnects (in minutes)
 -- Set to 0 for infinite (until server restart or towed)
 Config.VehicleTimeout = 0  -- 0 = vehicles persist indefinitely
@@ -48,17 +58,33 @@ Config.BlacklistedModels = {
     'lguard',
     'pbus',
     'pranger',
-    -- Job boats (ocean-delivery)
+    -- Job boats (dps-maritime / ocean-delivery)
     'dinghy',
     'dinghy2',
     'dinghy3',
     'dinghy4',
+    'dinghy5',
     'jetmax',
     'marquis',
     'toro',
     'toro2',
     'tropic',
     'tropic2',
+    'speeder',
+    'speeder2',
+    'seashark',
+    'seashark2',
+    'seashark3',
+    'squalo',
+    'suntrap',
+    'tug',
+    'costal',
+    'costal2',
+    'longfin',
+    'avisa',
+    'submersible',
+    'submersible2',
+    'patrolboat',
     -- Job vehicles (forklifts, etc.)
     'forklift',
     'mower',
