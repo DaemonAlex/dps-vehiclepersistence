@@ -1,6 +1,9 @@
 # DPS Vehicle Persistence
 
-Realistic vehicle world persistence system for QBCore FiveM servers. Vehicles stay where you park them - just like real life.
+Realistic vehicle world persistence system for FiveM servers. Vehicles stay where you park them - just like real life.
+
+**Version:** 2.0.0
+**Framework:** QB-Core / QBX / ESX (auto-detected)
 
 ## Features
 
@@ -8,16 +11,18 @@ Realistic vehicle world persistence system for QBCore FiveM servers. Vehicles st
 - **Restart Persistence** - Vehicles respawn after server restarts in the same location
 - **Full Property Saving** - Mods, colors, liveries, fuel, and damage are preserved
 - **Ownership Tracking** - Only owned vehicles are persisted
-- **Automatic Cleanup** - Destroyed vehicles and orphaned vehicles are cleaned up
-- **Towing System** - Police/Tow jobs can remove persistent vehicles
-- **Configurable Limits** - Max vehicles per player, blacklisted models/jobs
-- **Garage Integration** - Vehicles stored in garages are removed from world persistence
+- **Multi-Framework** - Supports QB-Core, QBX, and ESX
+- **Garage Integration** - Works with 7+ garage systems
+- **Script Coordination** - Exports to prevent conflicts with other vehicle scripts
+- **State Bags** - Efficient synchronization using FiveM's state bag system
+- **Orphaned Cleanup** - Auto-impound or delete abandoned vehicles
+- **Admin Exempt** - Staff vehicles don't persist (configurable)
 
 ## Requirements
 
-- [qb-core](https://github.com/qbcore-framework/qb-core)
 - [ox_lib](https://github.com/overextended/ox_lib)
 - [oxmysql](https://github.com/overextended/oxmysql)
+- One of: qb-core, qbx_core, or es_extended
 
 ## Installation
 
@@ -33,28 +38,25 @@ Realistic vehicle world persistence system for QBCore FiveM servers. Vehicles st
 
 3. Restart your server - the database table creates automatically
 
-## Database
+## Supported Integrations
 
-The resource automatically creates the required database table on first start. If you need to create it manually, run the following SQL:
+### Garage Systems
+| System | Status |
+|--------|--------|
+| qs-advancedgarages (Quasar) | ✅ Full Support |
+| jg-advancedgarages (JG Scripts) | ✅ Full Support |
+| qb-garages (QBCore) | ✅ Full Support |
+| cd_garage (Codesign) | ✅ Full Support |
+| loaf_garage (Loaf) | ✅ Full Support |
+| okokGarage (okok) | ✅ Full Support |
+| esx_advancedgarage (ESX) | ✅ Full Support |
 
-```sql
-CREATE TABLE IF NOT EXISTS `dps_world_vehicles` (
-    `id` INT AUTO_INCREMENT PRIMARY KEY,
-    `plate` VARCHAR(8) NOT NULL,
-    `citizenid` VARCHAR(50) NOT NULL,
-    `model` VARCHAR(50) NOT NULL,
-    `coords` LONGTEXT NOT NULL,
-    `heading` FLOAT NOT NULL,
-    `props` LONGTEXT,
-    `fuel` FLOAT DEFAULT 100.0,
-    `body` FLOAT DEFAULT 1000.0,
-    `engine` FLOAT DEFAULT 1000.0,
-    `saved_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY `plate_unique` (`plate`),
-    INDEX `idx_citizenid` (`citizenid`),
-    INDEX `idx_saved_at` (`saved_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
+### Other Integrations
+- **Dealerships:** jg-dealerships, qs-dealership, qb-vehicleshop
+- **Towing:** dps-towjob, qb-tow, generic
+- **Law Enforcement:** police impound, ps-mdt, qb-policejob
+- **Mechanics:** jg-mechanic, qs-mechanicjob
+- **Admin Menus:** vMenu, txAdmin, qb-adminmenu
 
 ## Configuration
 
@@ -63,100 +65,74 @@ Edit `config.lua` to customize the system:
 ```lua
 Config = {}
 
--- How long a vehicle stays in the world after the owner disconnects (in minutes)
--- Set to 0 for infinite (until server restart or towed)
-Config.VehicleTimeout = 0
-
--- Should vehicles persist through server restarts?
-Config.PersistThroughRestart = true
-
--- Maximum vehicles per player that can persist in the world
-Config.MaxVehiclesPerPlayer = 5
-
--- Minimum time a vehicle must be stationary before being saved (seconds)
-Config.MinStationaryTime = 30
-
--- Distance from garage to auto-store vehicle instead of world persist
-Config.GarageProximityCheck = false
-Config.GarageProximityDistance = 50.0
-
--- Vehicle types to persist
-Config.PersistTypes = {
-    'automobile',
-    'bike',
-    'boat',
-    'heli',
-    'plane',
-    'quadbike',
-    'trailer'
-}
-
--- Vehicles that should NOT persist (emergency vehicles, rentals, etc.)
-Config.BlacklistedModels = {
-    'police',
-    'police2',
-    'police3',
-    'police4',
-    'policeb',
-    'polmav',
-    'riot',
-    'riot2',
-    'fbi',
-    'fbi2',
-    'sheriff',
-    'sheriff2',
-    'ambulance',
-    'firetruk',
-    'lguard',
-    'pbus',
-    'pranger'
-}
-
--- Jobs whose vehicles should not persist (they use job garages)
-Config.BlacklistedJobs = {
-    'police',
-    'sheriff',
-    'ambulance',
-    'fire',
-    'mechanic'
-}
-
--- Spawn delay between each vehicle on server start (ms)
-Config.SpawnDelay = 500
-
--- Debug mode - prints vehicle persistence info to console
+Config.Enabled = true
 Config.Debug = false
+
+-- Admin/Staff vehicles don't persist (good for testing)
+Config.AdminExempt = true
+Config.StaffGroups = { 'admin', 'god', 'superadmin', 'mod', 'dev' }
+
+-- Persistence Settings
+Config.VehicleTimeout = 0  -- Minutes (0 = infinite)
+Config.PersistThroughRestart = true
+Config.MaxVehiclesPerPlayer = 5
+Config.MinStationaryTime = 30  -- Seconds
+Config.SpawnDelay = 500  -- MS between spawns on restart
+
+-- Garage Integration (auto-detected)
+Config.GarageResource = 'auto'
+
+-- Orphaned Vehicle Cleanup
+Config.OrphanedVehicles = {
+    orphanThresholdDays = 7,
+    action = 'impound',  -- 'impound' or 'delete'
+    impoundLot = 'impound',
+    feePerDay = 100,
+    maxFee = 1500,
+    cleanupInterval = 30  -- Minutes
+}
+
+-- Tow Job Permissions
+Config.TowJobs = { 'police', 'sheriff', 'tow', 'mechanic' }
+
+-- Fuel System (auto-detected)
+Config.FuelResource = 'auto'
 ```
 
 ## Admin Commands
 
 | Command | Permission | Description |
 |---------|------------|-------------|
-| `/clearworldvehicles` | admin | Remove all persisted vehicles from the world and database |
-| `/listworldvehicles` | admin | List all persisted vehicles in the server console |
+| `/clearworldvehicles` | admin | Remove all persisted vehicles |
+| `/listworldvehicles` | admin | List all persisted vehicles (console) |
 
-## How It Works
+## Exports for Script Integration
 
-1. **Vehicle Exit Detection** - When a player exits their owned vehicle, the system saves:
-   - Position and heading
-   - All vehicle properties (mods, colors, extras, liveries)
-   - Fuel level
-   - Body and engine damage
+### Vehicle Control Coordination
 
-2. **Player Disconnect** - When a player disconnects, their parked vehicles remain in the world
+Other scripts should use these exports to prevent conflicts:
 
-3. **Server Restart** - On server start, all persisted vehicles are respawned with their saved properties
+```lua
+-- EXCLUSION SYSTEM (Permanent - job vehicles, rentals, etc.)
+exports['dps-vehiclepersistence']:ExcludeFromPersistence(plate, 'my-resource', 'reason')
+exports['dps-vehiclepersistence']:RemoveExclusion(plate)
+exports['dps-vehiclepersistence']:IsExcludedFromPersistence(plate)
 
-4. **Garage Storage** - When a vehicle is stored in a garage (jg-advancedgarages or qb-garage), it's removed from world persistence
+-- LOCK SYSTEM (Temporary - during towing, mechanic work, etc.)
+exports['dps-vehiclepersistence']:LockVehicle(plate, 'my-resource')
+exports['dps-vehiclepersistence']:UnlockVehicle(plate)
+exports['dps-vehiclepersistence']:IsVehicleLocked(plate)
 
-5. **Cleanup** - The system automatically:
-   - Removes destroyed vehicles
-   - Cleans up vehicles from inactive players (7+ days)
-   - Enforces per-player vehicle limits (oldest removed first)
+-- NOTIFICATION SYSTEM
+-- Actions: 'stored', 'impounded', 'deleted', 'spawned'
+exports['dps-vehiclepersistence']:NotifyVehicleHandled(plate, action, 'my-resource')
 
-## Exports
+-- QUERY
+exports['dps-vehiclepersistence']:GetVehicleStatus(plate)
+-- Returns: { isPersisted, isExcluded, isLocked, exclusionInfo, lockInfo, persistenceData }
+```
 
-For other resources to interact with the system:
+### Basic Exports
 
 ```lua
 -- Get all world vehicles
@@ -180,48 +156,98 @@ TriggerServerEvent('dps-vehiclepersistence:vehicleStored', plate)
 -- Vehicle destroyed
 TriggerServerEvent('dps-vehiclepersistence:vehicleDestroyed', plate)
 
--- Tow a vehicle (requires police/sheriff/tow/mechanic job)
-TriggerServerEvent('dps-vehiclepersistence:towVehicle', plate)
+-- Exclude vehicle from persistence
+TriggerServerEvent('dps-vehiclepersistence:excludeVehicle', plate, 'reason')
+
+-- Lock/Unlock vehicle
+TriggerServerEvent('dps-vehiclepersistence:lockVehicle', plate)
+TriggerServerEvent('dps-vehiclepersistence:unlockVehicle', plate)
+
+-- Notify vehicle handled by another script
+TriggerServerEvent('dps-vehiclepersistence:notifyHandled', plate, 'action')
 ```
 
 ### Client Events
 
 ```lua
--- Tow the nearest unoccupied vehicle
+-- Tow the nearest unoccupied vehicle (requires tow job)
 TriggerEvent('dps-vehiclepersistence:towNearestVehicle')
+```
+
+## State Bags
+
+The script uses FiveM state bags for efficient sync:
+
+```lua
+-- Check if vehicle is persisted (client-side)
+local state = Entity(vehicle).state
+local isPersisted = state['dps:persisted']
+local owner = state['dps:owner']
+local plate = state['dps:plate']
+```
+
+## Database
+
+The resource automatically creates the required database table on first start:
+
+```sql
+CREATE TABLE IF NOT EXISTS `dps_world_vehicles` (
+    `id` INT AUTO_INCREMENT PRIMARY KEY,
+    `plate` VARCHAR(8) NOT NULL,
+    `citizenid` VARCHAR(50) NOT NULL,
+    `model` VARCHAR(50) NOT NULL,
+    `coords` LONGTEXT NOT NULL,
+    `heading` FLOAT NOT NULL,
+    `props` LONGTEXT,
+    `fuel` FLOAT DEFAULT 100.0,
+    `body` FLOAT DEFAULT 1000.0,
+    `engine` FLOAT DEFAULT 1000.0,
+    `saved_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY `plate_unique` (`plate`),
+    INDEX `idx_citizenid` (`citizenid`),
+    INDEX `idx_saved_at` (`saved_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ## Fuel System Compatibility
 
-The resource automatically detects and works with:
+Auto-detects and works with:
 - ox_fuel
 - LegacyFuel
 - cdn-fuel
 - ps-fuel
 - Native fuel (fallback)
 
-## Garage Compatibility
+## How It Works
 
-Automatically integrates with:
-- jg-advancedgarages
-- qb-garage
+1. **Vehicle Exit Detection** - When a player exits their owned vehicle, the system saves position, properties, fuel, and damage
 
-When vehicles are stored, they're removed from world persistence.
+2. **Player Disconnect** - Vehicles remain in the world with owner identifier attached
+
+3. **Server Restart** - All persisted vehicles respawn with saved properties
+
+4. **Garage Storage** - When stored in any supported garage, the vehicle is removed from world persistence
+
+5. **Orphan Cleanup** - Vehicles from inactive players (7+ days) are auto-impounded or deleted
+
+6. **Script Coordination** - Other scripts can lock, exclude, or notify about vehicles to prevent conflicts
 
 ## Performance
 
-- Vehicles spawn with a configurable delay to prevent server lag
-- Props are applied when players get within 50 units of spawned vehicles
-- Cleanup runs every 30 minutes to remove orphaned vehicles
-- Minimal client-side impact with 500ms/2000ms check intervals
+- Tiered throttling: faster checks near vehicles, slower when distant
+- Batched prop requests (max 3 per tick)
+- State bags reduce network events
+- Configurable spawn delay prevents server lag
+- Stale lock auto-cleanup (5 minute timeout)
 
 ## Troubleshooting
 
 **Vehicles not persisting?**
-- Check if the vehicle model is blacklisted in config
+- Check if the vehicle model is blacklisted
 - Check if the player's job is blacklisted
-- Ensure the player owns the vehicle (in `player_vehicles` table)
-- Enable `Config.Debug = true` to see console output
+- Ensure the player owns the vehicle (in database)
+- Check if Config.AdminExempt is excluding staff
+- Enable `Config.Debug = true`
 
 **Vehicles not spawning after restart?**
 - Check `Config.PersistThroughRestart = true`
@@ -229,8 +255,30 @@ When vehicles are stored, they're removed from world persistence.
 - Check server console for spawn errors
 
 **Props not applying?**
-- Props apply when a player gets within 50 units
+- Props apply when a player gets within render distance
 - Check for ox_lib errors in console
+
+**Conflicts with other scripts?**
+- Use the exclusion/lock exports
+- Ensure garage integration events are firing
+- Check if admin-spawned vehicles are being excluded
+
+## Changelog
+
+### v2.0.0
+- Multi-framework support (QB/QBX/ESX)
+- Bridge architecture for framework abstraction
+- 7+ garage system integrations
+- Script coordination exports (Lock, Exclude, Notify)
+- State bag synchronization
+- Admin menu integrations (vMenu, txAdmin, qb-admin)
+- Dealership, tow, mechanic integrations
+- Orphaned vehicle impound system
+- Version checker with admin notifications
+
+### v1.1.0
+- Initial public release
+- Basic persistence for QBCore
 
 ## License
 
@@ -239,5 +287,6 @@ This resource is provided for use on DPSRP servers. Feel free to modify for your
 ## Credits
 
 - DaemonAlex
-- QBCore Framework
+- DPSRP Development Team
+- QBCore/ESX Framework Teams
 - Overextended (ox_lib, oxmysql)

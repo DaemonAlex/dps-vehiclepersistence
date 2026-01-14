@@ -1,7 +1,7 @@
 -- DPS Vehicle Persistence - Client
 -- Tracks vehicles and sends data to server for persistence
+-- Framework: QB/QBX/ESX (via Bridge)
 
-local QBCore = exports['qb-core']:GetCoreObject()
 local currentVehicle = nil
 local lastVehicle = nil
 local isOwner = false
@@ -199,7 +199,7 @@ CreateThread(function()
                     netId = netId,
                     plate = plate,
                     model = modelName,
-                    citizenid = QBCore.Functions.GetPlayerData().citizenid,
+                    identifier = Bridge.GetIdentifier(),
                     coords = { x = coords.x, y = coords.y, z = coords.z },
                     heading = heading,
                     props = props,
@@ -312,19 +312,19 @@ end)
 
 -- ============================================
 -- EVENT-BASED GARAGE INTEGRATION
--- Pure event-driven approach - no polling
+-- Comprehensive support for all major garage systems
 -- ============================================
+
+-- Track props requests
+local propsRequested = {}
 
 -- Helper to notify server of garage storage
 local function NotifyVehicleStored(plate)
     if plate and plate ~= '' then
         plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
         TriggerServerEvent('dps-vehiclepersistence:vehicleStored', plate)
-        -- Clear from props cache so it can be re-requested if spawned again
         propsRequested[plate] = nil
-        if Config.Debug then
-            print('[dps-vehiclepersistence] Vehicle stored in garage: ' .. plate)
-        end
+        Bridge.Debug('Vehicle stored in garage: ' .. plate)
     end
 end
 
@@ -336,13 +336,26 @@ local function MarkGarageSpawned(vehicle, plate)
             plate = plate,
             spawnTime = GetGameTimer()
         }
-        if Config.Debug then
-            print('[dps-vehiclepersistence] Vehicle spawned from garage: ' .. plate)
-        end
+        Bridge.Debug('Vehicle spawned from garage: ' .. plate)
     end
 end
 
--- QB-Garage events
+-- Helper to find vehicle by plate
+local function FindVehicleByPlate(targetPlate)
+    local vehicles = GetGamePool('CVehicle')
+    for _, veh in ipairs(vehicles) do
+        local plate = GetVehicleNumberPlateText(veh)
+        plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+        if plate == targetPlate then
+            return veh
+        end
+    end
+    return nil
+end
+
+-- ═══════════════════════════════════════════════════════
+-- QB-GARAGES (QBCore Official)
+-- ═══════════════════════════════════════════════════════
 RegisterNetEvent('qb-garage:client:vehicleStore', function()
     local vehicle = GetVehiclePedIsIn(PlayerPedId(), false)
     if vehicle and vehicle ~= 0 then
@@ -353,21 +366,41 @@ end)
 
 RegisterNetEvent('qb-garage:client:TakeOutVehicle', function(vehicleInfo)
     if vehicleInfo and vehicleInfo.plate then
-        -- Wait for vehicle to spawn
         Wait(500)
-        local vehicles = GetGamePool('CVehicle')
-        for _, veh in ipairs(vehicles) do
-            local plate = GetVehicleNumberPlateText(veh)
-            plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
-            if plate == vehicleInfo.plate then
-                MarkGarageSpawned(veh, plate)
-                break
-            end
-        end
+        local veh = FindVehicleByPlate(vehicleInfo.plate)
+        if veh then MarkGarageSpawned(veh, vehicleInfo.plate) end
     end
 end)
 
--- JG-AdvancedGarages events
+-- ═══════════════════════════════════════════════════════
+-- QS-ADVANCEDGARAGES (Quasar)
+-- ═══════════════════════════════════════════════════════
+RegisterNetEvent('qs-advancedgarages:client:vehicleStored', function(data)
+    if data and data.plate then
+        NotifyVehicleStored(data.plate)
+    elseif type(data) == 'string' then
+        NotifyVehicleStored(data)
+    end
+end)
+
+RegisterNetEvent('qs-advancedgarages:client:vehicleSpawned', function(vehicle, plate)
+    if vehicle and plate then
+        MarkGarageSpawned(vehicle, plate)
+    end
+end)
+
+-- Alternative Quasar events
+RegisterNetEvent('qs-advancedgarages:vehicleStored', function(data)
+    if data and data.plate then NotifyVehicleStored(data.plate) end
+end)
+
+RegisterNetEvent('qs-advancedgarages:vehicleSpawned', function(vehicle, plate)
+    MarkGarageSpawned(vehicle, plate)
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- JG-ADVANCEDGARAGES (JG Scripts)
+-- ═══════════════════════════════════════════════════════
 RegisterNetEvent('jg-advancedgarages:client:VehicleStored', function(data)
     if data and data.plate then
         NotifyVehicleStored(data.plate)
@@ -378,7 +411,9 @@ RegisterNetEvent('jg-advancedgarages:client:vehicleSpawned', function(vehicle, p
     MarkGarageSpawned(vehicle, plate)
 end)
 
--- CD-Garage events
+-- ═══════════════════════════════════════════════════════
+-- CD_GARAGE (Codesign)
+-- ═══════════════════════════════════════════════════════
 RegisterNetEvent('cd_garage:client:Stored', function(plate)
     NotifyVehicleStored(plate)
 end)
@@ -387,24 +422,241 @@ RegisterNetEvent('cd_garage:client:Spawned', function(vehicle, plate)
     MarkGarageSpawned(vehicle, plate)
 end)
 
--- Qs-Garage / Quasar events
-RegisterNetEvent('qs-advancedgarages:vehicleStored', function(data)
-    if data and data.plate then
-        NotifyVehicleStored(data.plate)
-    end
+RegisterNetEvent('cd_garage:StoreVehicle', function(plate)
+    NotifyVehicleStored(plate)
 end)
 
-RegisterNetEvent('qs-advancedgarages:vehicleSpawned', function(vehicle, plate)
+-- ═══════════════════════════════════════════════════════
+-- LOAF_GARAGE (Loaf Scripts)
+-- ═══════════════════════════════════════════════════════
+RegisterNetEvent('loaf_garage:stored', function(plate)
+    NotifyVehicleStored(plate)
+end)
+
+RegisterNetEvent('loaf_garage:spawned', function(vehicle, plate)
     MarkGarageSpawned(vehicle, plate)
 end)
 
--- Generic vehicle delete/impound events
+-- ═══════════════════════════════════════════════════════
+-- OKOKGARAGE (okok Scripts)
+-- ═══════════════════════════════════════════════════════
+RegisterNetEvent('okokGarage:vehicleStored', function(plate)
+    NotifyVehicleStored(plate)
+end)
+
+RegisterNetEvent('okokGarage:vehicleSpawned', function(vehicle, plate)
+    MarkGarageSpawned(vehicle, plate)
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- ESX_ADVANCEDGARAGE (ESX)
+-- ═══════════════════════════════════════════════════════
+RegisterNetEvent('esx_advancedgarage:stored', function(plate)
+    NotifyVehicleStored(plate)
+end)
+
+RegisterNetEvent('esx_advancedgarage:spawned', function(vehicle, plate)
+    MarkGarageSpawned(vehicle, plate)
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- GENERIC / FALLBACK EVENTS
+-- ═══════════════════════════════════════════════════════
 RegisterNetEvent('vehiclekeys:client:SetOwner', function(plate)
-    -- New ownership established, likely from purchase or spawn
-    if plate then
-        propsRequested[plate] = nil
+    if plate then propsRequested[plate] = nil end
+end)
+
+-- Generic garage store (many scripts use this)
+RegisterNetEvent('garage:vehicleStored', function(plate)
+    NotifyVehicleStored(plate)
+end)
+
+RegisterNetEvent('garage:vehicleSpawned', function(vehicle, plate)
+    MarkGarageSpawned(vehicle, plate)
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- DEALERSHIP INTEGRATIONS
+-- ═══════════════════════════════════════════════════════
+
+-- JG-Dealerships
+RegisterNetEvent('jg-dealerships:client:vehiclePurchased', function(vehicleData)
+    if vehicleData and vehicleData.plate then
+        Wait(1000)
+        local veh = FindVehicleByPlate(vehicleData.plate)
+        if veh then MarkGarageSpawned(veh, vehicleData.plate) end
     end
 end)
+
+-- QS-Dealership (Quasar)
+RegisterNetEvent('qs-dealership:vehiclePurchased', function(plate)
+    Wait(1000)
+    local veh = FindVehicleByPlate(plate)
+    if veh then MarkGarageSpawned(veh, plate) end
+end)
+
+-- QB-Dealerships
+RegisterNetEvent('qb-vehicleshop:client:buyShowroomVehicle', function(vehicleData)
+    if vehicleData and vehicleData.plate then
+        Wait(1000)
+        local veh = FindVehicleByPlate(vehicleData.plate)
+        if veh then MarkGarageSpawned(veh, vehicleData.plate) end
+    end
+end)
+
+-- Generic dealership
+RegisterNetEvent('dealership:vehiclePurchased', function(plate)
+    Wait(1000)
+    local veh = FindVehicleByPlate(plate)
+    if veh then MarkGarageSpawned(veh, plate) end
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- LAW ENFORCEMENT INTEGRATIONS
+-- ═══════════════════════════════════════════════════════
+
+-- Police impound (removes from persistence)
+RegisterNetEvent('police:client:ImpoundVehicle', function(plate, data)
+    if plate then NotifyVehicleStored(plate) end
+end)
+
+RegisterNetEvent('ps-mdt:client:ImpoundVehicle', function(plate)
+    if plate then NotifyVehicleStored(plate) end
+end)
+
+RegisterNetEvent('qb-policejob:client:ImpoundVehicle', function(plate)
+    if plate then NotifyVehicleStored(plate) end
+end)
+
+-- Seized vehicles
+RegisterNetEvent('police:client:SeizeVehicle', function(plate)
+    if plate then NotifyVehicleStored(plate) end
+end)
+
+-- Evidence system - don't persist evidence vehicles
+RegisterNetEvent('evidence:client:storeVehicle', function(plate)
+    if plate then NotifyVehicleStored(plate) end
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- TOWING INTEGRATIONS (dps-towjob, qb-tow, etc.)
+-- ═══════════════════════════════════════════════════════
+
+-- DPS-TowJob integration
+RegisterNetEvent('dps-towjob:client:vehicleTowed', function(plate)
+    if plate then
+        NotifyVehicleStored(plate)
+        Bridge.Debug('Vehicle towed by dps-towjob: ' .. plate)
+    end
+end)
+
+RegisterNetEvent('dps-towjob:client:vehicleDropped', function(vehicleData)
+    if vehicleData and vehicleData.plate then
+        Wait(500)
+        local veh = FindVehicleByPlate(vehicleData.plate)
+        if veh then MarkGarageSpawned(veh, vehicleData.plate) end
+    end
+end)
+
+-- QB-Tow integration
+RegisterNetEvent('qb-tow:client:VehicleTowed', function(plate)
+    if plate then NotifyVehicleStored(plate) end
+end)
+
+-- Generic tow events
+RegisterNetEvent('tow:client:vehicleTowed', function(plate)
+    if plate then NotifyVehicleStored(plate) end
+end)
+
+RegisterNetEvent('tow:vehicleImpounded', function(plate)
+    if plate then NotifyVehicleStored(plate) end
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- MECHANIC SHOP INTEGRATIONS
+-- ═══════════════════════════════════════════════════════
+
+-- JG-Mechanic - vehicle stored at shop
+RegisterNetEvent('jg-mechanic:client:vehicleStored', function(plate)
+    if plate then NotifyVehicleStored(plate) end
+end)
+
+-- QS-Mechanic
+RegisterNetEvent('qs-mechanicjob:vehicleStored', function(plate)
+    if plate then NotifyVehicleStored(plate) end
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- RENTAL VEHICLE INTEGRATIONS
+-- ═══════════════════════════════════════════════════════
+
+-- Mark rental vehicles (shouldn't persist)
+RegisterNetEvent('rental:client:vehicleRented', function(vehicle, plate)
+    if vehicle and plate then
+        -- Mark as excluded from persistence
+        TriggerServerEvent('dps-vehiclepersistence:excludeVehicle', plate, 'rental')
+    end
+end)
+
+RegisterNetEvent('rental:client:vehicleReturned', function(plate)
+    if plate then
+        TriggerServerEvent('dps-vehiclepersistence:removeExclusion', plate)
+        NotifyVehicleStored(plate)
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- ADMIN MENU INTEGRATIONS
+-- Handle vehicles spawned/deleted by admin tools
+-- ═══════════════════════════════════════════════════════
+
+-- vMenu vehicle spawn
+RegisterNetEvent('vMenu:PlayerSpawnedVehicle', function(vehicle)
+    if vehicle and DoesEntityExist(vehicle) then
+        local plate = GetVehicleNumberPlateText(vehicle)
+        -- Admin spawned vehicles should NOT persist
+        TriggerServerEvent('dps-vehiclepersistence:excludeVehicle', plate, 'admin-spawn')
+    end
+end)
+
+-- txAdmin/Lambda vehicle spawn
+RegisterNetEvent('txAdmin:spawnedVehicle', function(vehicle, plate)
+    if plate then
+        TriggerServerEvent('dps-vehiclepersistence:excludeVehicle', plate, 'txadmin-spawn')
+    end
+end)
+
+-- qb-adminmenu spawn
+RegisterNetEvent('qb-admin:client:SpawnVehicle', function()
+    Wait(500)
+    local ped = PlayerPedId()
+    local vehicle = GetVehiclePedIsIn(ped, false)
+    if vehicle and vehicle ~= 0 then
+        local plate = GetVehicleNumberPlateText(vehicle)
+        TriggerServerEvent('dps-vehiclepersistence:excludeVehicle', plate, 'qb-admin-spawn')
+    end
+end)
+
+-- Generic admin delete event - remove from persistence
+RegisterNetEvent('admin:deleteVehicle', function(plate)
+    if plate then
+        TriggerServerEvent('dps-vehiclepersistence:notifyHandled', plate, 'deleted')
+    end
+end)
+
+-- QBCore admin vehicle delete
+RegisterNetEvent('qb-admin:client:DeleteVehicle', function()
+    local ped = PlayerPedId()
+    local vehicle = GetLastVehiclePedWasIn(ped)
+    if vehicle and DoesEntityExist(vehicle) then
+        local plate = GetVehicleNumberPlateText(vehicle)
+        TriggerServerEvent('dps-vehiclepersistence:notifyHandled', plate, 'deleted')
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- TOW VEHICLE COMMAND
+-- ═══════════════════════════════════════════════════════
 
 -- Tow vehicle command (for police/tow jobs)
 RegisterNetEvent('dps-vehiclepersistence:towNearestVehicle', function()

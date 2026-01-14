@@ -1,7 +1,7 @@
 -- DPS Vehicle Persistence - Server
 -- Realistic vehicle world persistence system
+-- Framework: QB/QBX/ESX (via Bridge)
 
-local QBCore = exports['qb-core']:GetCoreObject()
 local worldVehicles = {}  -- Track vehicles in the world
 local playerVehicles = {} -- Track which vehicles belong to which player
 local vehiclePropsQueue = {} -- Queue for vehicles needing props applied
@@ -100,21 +100,7 @@ end)
 
 -- Callback to check if player owns a vehicle
 lib.callback.register('dps-vehiclepersistence:checkOwnership', function(source, plate)
-    local Player = QBCore.Functions.GetPlayer(source)
-    if not Player then
-        return false
-    end
-
-    local citizenid = Player.PlayerData.citizenid
-
-    -- Check player_vehicles table
-    local result = MySQL.query.await('SELECT citizenid FROM player_vehicles WHERE plate = ?', {plate})
-
-    if result and result[1] then
-        return result[1].citizenid == citizenid
-    else
-        return false
-    end
+    return Bridge.CheckVehicleOwnership(source, plate)
 end)
 
 -- Initialize database table
@@ -165,13 +151,21 @@ local function IsBlacklisted(model)
 end
 
 -- Check if player's job is blacklisted
-local function IsJobBlacklisted(citizenid)
-    local player = QBCore.Functions.GetPlayerByCitizenId(citizenid)
+local function IsJobBlacklisted(identifier)
+    local player = Bridge.GetPlayerByIdentifier(identifier)
     if player then
-        local job = player.PlayerData.job.name
-        for _, blacklisted in ipairs(Config.BlacklistedJobs) do
-            if blacklisted == job then
-                return true
+        local job = nil
+        if Bridge.Framework == 'qb' or Bridge.Framework == 'qbx' then
+            job = player.PlayerData.job.name
+        elseif Bridge.Framework == 'esx' then
+            job = player.job.name
+        end
+
+        if job then
+            for _, blacklisted in ipairs(Config.BlacklistedJobs) do
+                if blacklisted == job then
+                    return true
+                end
             end
         end
     end
@@ -187,15 +181,12 @@ local function IsPlayerAdmin(source)
     if IsPlayerAceAllowed(source, 'command') then return true end
     if IsPlayerAceAllowed(source, 'admin') then return true end
 
-    -- Check QBCore staff permissions (configurable in config.lua)
-    local Player = QBCore.Functions.GetPlayer(source)
-    if Player then
-        local group = Player.PlayerData.group or QBCore.Functions.GetPermission(source)
-        local staffGroups = Config.StaffGroups or { 'admin', 'god' }
-        for _, staffGroup in ipairs(staffGroups) do
-            if group == staffGroup then
-                return true
-            end
+    -- Check framework-specific staff permissions
+    local group = Bridge.GetPermissionGroup(source)
+    local staffGroups = Config.StaffGroups or { 'admin', 'god' }
+    for _, staffGroup in ipairs(staffGroups) do
+        if group == staffGroup then
+            return true
         end
     end
 
@@ -299,7 +290,7 @@ function SpawnPersistedVehicles()
                 local vehicleData = {
                     netId = netId,
                     entity = vehicle,
-                    citizenid = veh.citizenid,
+                    identifier = veh.citizenid, -- citizenid column stores the identifier
                     model = veh.model,
                     plate = veh.plate,
                     fuel = veh.fuel,
@@ -359,17 +350,16 @@ RegisterNetEvent('dps-vehiclepersistence:vehicleEntered', function(netId, plate,
     if Config.Enabled == false then return end
     local src = source
     if IsPlayerAdmin(src) then return end -- Admin exempt
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then return end
 
-    local citizenid = Player.PlayerData.citizenid
+    local identifier = Bridge.GetIdentifier(src)
+    if not identifier then return end
 
     -- If this is the owner's vehicle, track it
     if isOwner then
-        if not playerVehicles[citizenid] then
-            playerVehicles[citizenid] = {}
+        if not playerVehicles[identifier] then
+            playerVehicles[identifier] = {}
         end
-        playerVehicles[citizenid][plate] = netId
+        playerVehicles[identifier][plate] = netId
 
         -- Remove from world vehicles since owner is driving
         if worldVehicles[plate] then
@@ -383,22 +373,21 @@ RegisterNetEvent('dps-vehiclepersistence:vehicleExited', function(vehicleData)
     if Config.Enabled == false then return end
     local src = source
     if IsPlayerAdmin(src) then return end -- Admin exempt
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then return end
 
-    local citizenid = Player.PlayerData.citizenid
+    local identifier = Bridge.GetIdentifier(src)
+    if not identifier then return end
 
-    -- Check if player owns this vehicle
-    if vehicleData.citizenid ~= citizenid then return end
+    -- Check if player owns this vehicle (client sends identifier)
+    if vehicleData.identifier ~= identifier then return end
 
     -- Check blacklists
     if IsBlacklisted(vehicleData.model) then return end
-    if IsJobBlacklisted(citizenid) then return end
+    if IsJobBlacklisted(identifier) then return end
 
     -- Count player's world vehicles
     local count = 0
     for plate, veh in pairs(worldVehicles) do
-        if veh.citizenid == citizenid and not veh.beingDriven then
+        if veh.identifier == identifier and not veh.beingDriven then
             count = count + 1
         end
     end
@@ -409,7 +398,7 @@ RegisterNetEvent('dps-vehiclepersistence:vehicleExited', function(vehicleData)
         local oldest = nil
         local oldestTime = math.huge
         for plate, veh in pairs(worldVehicles) do
-            if veh.citizenid == citizenid and veh.savedAt and veh.savedAt < oldestTime then
+            if veh.identifier == identifier and veh.savedAt and veh.savedAt < oldestTime then
                 oldest = plate
                 oldestTime = veh.savedAt
             end
@@ -423,7 +412,7 @@ RegisterNetEvent('dps-vehiclepersistence:vehicleExited', function(vehicleData)
     -- Track this vehicle
     worldVehicles[vehicleData.plate] = {
         netId = vehicleData.netId,
-        citizenid = citizenid,
+        identifier = identifier,
         model = vehicleData.model,
         plate = vehicleData.plate,
         coords = vehicleData.coords,
@@ -436,11 +425,22 @@ RegisterNetEvent('dps-vehiclepersistence:vehicleExited', function(vehicleData)
         beingDriven = false
     }
 
-    -- Save to database
-    SaveVehicleToDB(worldVehicles[vehicleData.plate])
+    -- Save to database (uses citizenid column for QB compat)
+    local dbData = {
+        plate = vehicleData.plate,
+        citizenid = identifier, -- Column name in DB
+        model = vehicleData.model,
+        coords = vehicleData.coords,
+        heading = vehicleData.heading,
+        props = vehicleData.props,
+        fuel = vehicleData.fuel,
+        body = vehicleData.body,
+        engine = vehicleData.engine
+    }
+    SaveVehicleToDB(dbData)
 
     if Config.Debug then
-        print('^2[dps-vehiclepersistence] Vehicle parked: ' .. vehicleData.plate .. ' by ' .. citizenid)
+        print('^2[dps-vehiclepersistence] Vehicle parked: ' .. vehicleData.plate .. ' by ' .. identifier)
     end
 end)
 
@@ -460,25 +460,23 @@ end)
 -- Handle player disconnect
 AddEventHandler('playerDropped', function(reason)
     local src = source
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then return end
-
-    local citizenid = Player.PlayerData.citizenid
+    local identifier = Bridge.GetIdentifier(src)
+    if not identifier then return end
 
     -- Save all vehicles the player was near/driving
-    if playerVehicles[citizenid] then
-        for plate, netId in pairs(playerVehicles[citizenid]) do
+    if playerVehicles[identifier] then
+        for plate, netId in pairs(playerVehicles[identifier]) do
             -- Vehicle will be tracked by world vehicles system
             -- Mark as no longer being driven
             if worldVehicles[plate] then
                 worldVehicles[plate].beingDriven = false
             end
         end
-        playerVehicles[citizenid] = nil
+        playerVehicles[identifier] = nil
     end
 
     if Config.Debug then
-        print('^3[dps-vehiclepersistence] Player disconnected: ' .. citizenid)
+        print('^3[dps-vehiclepersistence] Player disconnected: ' .. identifier)
     end
 end)
 
@@ -498,14 +496,18 @@ end)
 -- Tow/impound a vehicle (removes from persistence)
 RegisterNetEvent('dps-vehiclepersistence:towVehicle', function(plate)
     local src = source
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then return end
+    local job = Bridge.GetPlayerJob(src)
+    if not job then return end
 
-    -- Check if player is police/tow job
-    local job = Player.PlayerData.job.name
-    if job ~= 'police' and job ~= 'sheriff' and job ~= 'tow' and job ~= 'mechanic' then
-        return
+    -- Check if player has tow permissions
+    local hasTowPerm = false
+    for _, towJob in ipairs(Config.TowJobs or {'police', 'sheriff', 'tow', 'mechanic'}) do
+        if job == towJob then
+            hasTowPerm = true
+            break
+        end
     end
+    if not hasTowPerm then return end
 
     if worldVehicles[plate] then
         RemoveVehicleFromDB(plate)
@@ -524,29 +526,20 @@ RegisterNetEvent('dps-vehiclepersistence:towVehicle', function(plate)
 end)
 
 -- Admin command to clear all persisted vehicles
-QBCore.Commands.Add('clearworldvehicles', 'Clear all persisted world vehicles (Admin)', {}, false, function(source, args)
+Bridge.AddCommand('clearworldvehicles', 'Clear all persisted world vehicles (Admin)', {}, true, function(source, args)
     MySQL.query('DELETE FROM dps_world_vehicles')
     worldVehicles = {}
 
-    TriggerClientEvent('ox_lib:notify', source, {
-        title = 'Vehicles Cleared',
-        description = 'All persisted world vehicles have been removed',
-        type = 'success'
-    })
-
+    Bridge.Notify(source, 'Vehicles Cleared', 'All persisted world vehicles have been removed', 'success')
     print('^1[dps-vehiclepersistence] All world vehicles cleared by admin')
-end, 'admin')
+end)
 
 -- Admin command to list persisted vehicles
-QBCore.Commands.Add('listworldvehicles', 'List all persisted world vehicles (Admin)', {}, false, function(source, args)
+Bridge.AddCommand('listworldvehicles', 'List all persisted world vehicles (Admin)', {}, true, function(source, args)
     local vehicles = MySQL.query.await('SELECT plate, citizenid, model FROM dps_world_vehicles')
 
     if not vehicles or #vehicles == 0 then
-        TriggerClientEvent('ox_lib:notify', source, {
-            title = 'World Vehicles',
-            description = 'No persisted vehicles found',
-            type = 'inform'
-        })
+        Bridge.Notify(source, 'World Vehicles', 'No persisted vehicles found', 'inform')
         return
     end
 
@@ -556,12 +549,8 @@ QBCore.Commands.Add('listworldvehicles', 'List all persisted world vehicles (Adm
     end
     print('^3Total: ' .. #vehicles .. ' vehicles')
 
-    TriggerClientEvent('ox_lib:notify', source, {
-        title = 'World Vehicles',
-        description = #vehicles .. ' vehicles persisted (check console)',
-        type = 'success'
-    })
-end, 'admin')
+    Bridge.Notify(source, 'World Vehicles', #vehicles .. ' vehicles persisted (check console)', 'success')
+end)
 
 -- Save all vehicles on server shutdown
 AddEventHandler('txAdmin:events:serverShuttingDown', function()
@@ -689,7 +678,7 @@ SetVehicleStateBag = function(entity, vehicleData)
 
     -- Core persistence data (minimal, frequently accessed)
     state:set('dps:persisted', true, true)
-    state:set('dps:owner', vehicleData.citizenid, true)
+    state:set('dps:owner', vehicleData.identifier, true)
     state:set('dps:plate', vehicleData.plate, true)
 
     -- Optional detailed data (set but not replicated frequently)
@@ -761,16 +750,23 @@ exports('RemovePersistedVehicle', function(plate)
 end)
 
 -- ============================================
--- JOB VEHICLE EXCLUSION (for dps-maritime, etc.)
--- Other resources can mark vehicles as "job vehicles"
--- to prevent persistence tracking
+-- VEHICLE CONTROL COORDINATION
+-- Any script that controls vehicles should use these
+-- to prevent conflicts with persistence
 -- ============================================
 
 local jobVehicles = {} -- [plate] = { resource, reason, timestamp }
+local lockedVehicles = {} -- [plate] = { resource, locked_at } - temporarily locked from persistence
 
--- Mark a vehicle as a job vehicle (excluded from persistence)
+-- ═══════════════════════════════════════════════════════
+-- EXCLUSION SYSTEM (Permanent - for job vehicles, rentals, etc.)
+-- ═══════════════════════════════════════════════════════
+
+-- Mark a vehicle as excluded from persistence
 exports('ExcludeFromPersistence', function(plate, resource, reason)
     if not plate then return false end
+
+    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
 
     jobVehicles[plate] = {
         resource = resource or 'unknown',
@@ -778,40 +774,118 @@ exports('ExcludeFromPersistence', function(plate, resource, reason)
         timestamp = os.time()
     }
 
-    -- Also remove if already tracked
+    -- Remove from persistence if already tracked
     if worldVehicles[plate] then
         RemoveVehicleFromDB(plate)
         worldVehicles[plate] = nil
     end
 
-    if Config.Debug then
-        print('^3[dps-vehiclepersistence] Vehicle excluded by ' .. (resource or 'unknown') .. ': ' .. plate)
+    Bridge.Debug('Vehicle excluded by ' .. (resource or 'unknown') .. ': ' .. plate .. ' (' .. (reason or 'no reason') .. ')')
+    return true
+end)
+
+-- Remove exclusion
+exports('RemoveExclusion', function(plate)
+    if not plate then return false end
+    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+
+    if jobVehicles[plate] then
+        jobVehicles[plate] = nil
+        Bridge.Debug('Vehicle exclusion removed: ' .. plate)
+        return true
+    end
+    return false
+end)
+
+-- Check if excluded
+exports('IsExcludedFromPersistence', function(plate)
+    if not plate then return false end
+    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+    return jobVehicles[plate] ~= nil
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- LOCK SYSTEM (Temporary - during active use by another script)
+-- ═══════════════════════════════════════════════════════
+
+-- Lock vehicle from persistence (during active towing, mechanic work, etc.)
+exports('LockVehicle', function(plate, resource)
+    if not plate then return false end
+    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+
+    lockedVehicles[plate] = {
+        resource = resource or 'unknown',
+        locked_at = os.time()
+    }
+
+    Bridge.Debug('Vehicle locked by ' .. (resource or 'unknown') .. ': ' .. plate)
+    return true
+end)
+
+-- Unlock vehicle (allow persistence again)
+exports('UnlockVehicle', function(plate)
+    if not plate then return false end
+    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+
+    if lockedVehicles[plate] then
+        lockedVehicles[plate] = nil
+        Bridge.Debug('Vehicle unlocked: ' .. plate)
+        return true
+    end
+    return false
+end)
+
+-- Check if locked
+exports('IsVehicleLocked', function(plate)
+    if not plate then return false end
+    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+    return lockedVehicles[plate] ~= nil
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- NOTIFICATION SYSTEM (For other scripts to coordinate)
+-- ═══════════════════════════════════════════════════════
+
+-- Notify persistence that a vehicle is being handled by another script
+exports('NotifyVehicleHandled', function(plate, action, resource)
+    if not plate then return false end
+    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+
+    if action == 'stored' or action == 'impounded' or action == 'deleted' then
+        -- Remove from world persistence
+        if worldVehicles[plate] then
+            RemoveVehicleFromDB(plate)
+            worldVehicles[plate] = nil
+        end
+        Bridge.Debug('Vehicle ' .. action .. ' by ' .. (resource or 'external') .. ': ' .. plate)
+    elseif action == 'spawned' then
+        -- New vehicle spawned - will be tracked when owner exits
+        Bridge.Debug('Vehicle spawned notification from ' .. (resource or 'external') .. ': ' .. plate)
     end
 
     return true
 end)
 
--- Remove exclusion (when job ends, vehicle returned to garage)
-exports('RemoveExclusion', function(plate)
-    if not plate then return false end
+-- ═══════════════════════════════════════════════════════
+-- QUERY EXPORTS (For other scripts to check status)
+-- ═══════════════════════════════════════════════════════
 
-    if jobVehicles[plate] then
-        jobVehicles[plate] = nil
-        if Config.Debug then
-            print('^2[dps-vehiclepersistence] Vehicle exclusion removed: ' .. plate)
-        end
-        return true
-    end
+-- Get full status of a vehicle
+exports('GetVehicleStatus', function(plate)
+    if not plate then return nil end
+    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
 
-    return false
+    return {
+        isPersisted = worldVehicles[plate] ~= nil,
+        isExcluded = jobVehicles[plate] ~= nil,
+        isLocked = lockedVehicles[plate] ~= nil,
+        exclusionInfo = jobVehicles[plate],
+        lockInfo = lockedVehicles[plate],
+        persistenceData = worldVehicles[plate]
+    }
 end)
 
--- Check if a vehicle is excluded
-exports('IsExcludedFromPersistence', function(plate)
-    return jobVehicles[plate] ~= nil
-end)
-
--- Event version for client-side use
+-- Event versions for client-side use
 RegisterNetEvent('dps-vehiclepersistence:excludeVehicle', function(plate, reason)
     local src = source
     exports['dps-vehiclepersistence']:ExcludeFromPersistence(plate, GetInvokingResource() or 'client', reason)
@@ -819,4 +893,33 @@ end)
 
 RegisterNetEvent('dps-vehiclepersistence:removeExclusion', function(plate)
     exports['dps-vehiclepersistence']:RemoveExclusion(plate)
+end)
+
+RegisterNetEvent('dps-vehiclepersistence:lockVehicle', function(plate)
+    exports['dps-vehiclepersistence']:LockVehicle(plate, GetInvokingResource() or 'client')
+end)
+
+RegisterNetEvent('dps-vehiclepersistence:unlockVehicle', function(plate)
+    exports['dps-vehiclepersistence']:UnlockVehicle(plate)
+end)
+
+RegisterNetEvent('dps-vehiclepersistence:notifyHandled', function(plate, action)
+    exports['dps-vehiclepersistence']:NotifyVehicleHandled(plate, action, GetInvokingResource() or 'client')
+end)
+
+-- Auto-cleanup stale locks (5 minute timeout)
+CreateThread(function()
+    while true do
+        Wait(60000) -- Check every minute
+
+        local now = os.time()
+        local staleTimeout = 300 -- 5 minutes
+
+        for plate, lockInfo in pairs(lockedVehicles) do
+            if now - lockInfo.locked_at > staleTimeout then
+                lockedVehicles[plate] = nil
+                Bridge.Debug('Stale lock removed for: ' .. plate)
+            end
+        end
+    end
 end)
