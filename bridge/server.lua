@@ -5,14 +5,12 @@
 
 local QBCore, ESX = nil, nil
 
--- Initialize framework objects
-CreateThread(function()
-    if Bridge.Framework == 'qb' or Bridge.Framework == 'qbx' then
-        QBCore = exports['qb-core']:GetCoreObject()
-    elseif Bridge.Framework == 'esx' then
-        ESX = exports['es_extended']:getSharedObject()
-    end
-end)
+-- Initialize framework objects synchronously (needed for commands registration)
+if Bridge.Framework == 'qb' or Bridge.Framework == 'qbx' then
+    QBCore = exports['qb-core']:GetCoreObject()
+elseif Bridge.Framework == 'esx' then
+    ESX = exports['es_extended']:getSharedObject()
+end
 
 -- ═══════════════════════════════════════════════════════
 -- PLAYER FUNCTIONS
