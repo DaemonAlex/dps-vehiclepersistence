@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS `dps_world_vehicles` (
     `plate` VARCHAR(8) NOT NULL,
     `citizenid` VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
     `model` VARCHAR(50) NOT NULL,
+    `vehicle_type` VARCHAR(24) NOT NULL DEFAULT 'automobile',
     `coords` LONGTEXT NOT NULL,
     `heading` FLOAT NOT NULL,
     `props` LONGTEXT,

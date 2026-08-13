@@ -90,36 +90,75 @@ local function GetVehicleProperties(vehicle)
     return lib.getVehicleProperties(vehicle)
 end
 
--- Get fuel level (supports multiple fuel systems)
+-- Detect the active fuel resource ONCE, honoring Config.FuelResource (#13).
+-- Read and apply both route through this, so they can never disagree.
+local detectedFuelResource = nil
+local function GetFuelResource()
+    if detectedFuelResource then return detectedFuelResource end
+
+    local cfg = Config.FuelResource
+    if cfg and cfg ~= 'auto' and cfg ~= 'native' then
+        if GetResourceState(cfg) == 'started' then
+            detectedFuelResource = cfg
+            return cfg
+        end
+    elseif cfg == 'native' then
+        detectedFuelResource = 'native'
+        return 'native'
+    end
+
+    for _, res in ipairs({ 'ox_fuel', 'LegacyFuel', 'cdn-fuel', 'ps-fuel' }) do
+        if GetResourceState(res) == 'started' then
+            detectedFuelResource = res
+            return res
+        end
+    end
+
+    detectedFuelResource = 'native'
+    return 'native'
+end
+
+-- Get fuel level (uses the single detected fuel resource)
 local function GetVehicleFuel(vehicle)
     if not vehicle or vehicle == 0 then return 100.0 end
 
-    -- Try ox_fuel
-    local success, fuel = pcall(function()
-        return exports.ox_fuel:GetFuel(vehicle)
-    end)
-    if success and fuel then return fuel end
+    local res = GetFuelResource()
+    if res ~= 'native' then
+        local ok, fuel = pcall(function()
+            return exports[res]:GetFuel(vehicle)
+        end)
+        if ok and type(fuel) == 'number' then return fuel end
+    end
 
-    -- Try LegacyFuel
-    success, fuel = pcall(function()
-        return exports.LegacyFuel:GetFuel(vehicle)
-    end)
-    if success and fuel then return fuel end
-
-    -- Try cdn-fuel
-    success, fuel = pcall(function()
-        return exports['cdn-fuel']:GetFuel(vehicle)
-    end)
-    if success and fuel then return fuel end
-
-    -- Try ps-fuel
-    success, fuel = pcall(function()
-        return exports['ps-fuel']:GetFuel(vehicle)
-    end)
-    if success and fuel then return fuel end
-
-    -- Fallback to native (may not be accurate)
     return GetVehicleFuelLevel(vehicle)
+end
+
+-- Set fuel level (uses the single detected fuel resource)
+local function SetVehicleFuel(vehicle, fuel)
+    if not vehicle or vehicle == 0 or type(fuel) ~= 'number' then return end
+
+    local res = GetFuelResource()
+    if res ~= 'native' then
+        local ok = pcall(function()
+            exports[res]:SetFuel(vehicle, fuel)
+        end)
+        if ok then return end
+    end
+
+    SetVehicleFuelLevel(vehicle, fuel + 0.0)
+end
+
+-- State-bag helpers (defined early so the destroy/live-state threads can use them)
+local function IsVehiclePersistedLocal(vehicle)
+    if not vehicle or not DoesEntityExist(vehicle) then return false end
+    local state = Entity(vehicle).state
+    return state['dps:persisted'] == true
+end
+
+local function GetVehicleOwnerLocal(vehicle)
+    if not vehicle or not DoesEntityExist(vehicle) then return nil end
+    local state = Entity(vehicle).state
+    return state['dps:owner']
 end
 
 -- Check if player owns this vehicle using server callback (WITH CACHING)
@@ -256,15 +295,16 @@ CreateThread(function()
                 local engine = GetVehicleEngineHealth(exitedVehicle)
                 local netId = NetworkGetNetworkIdFromEntity(exitedVehicle)
 
-                -- Get model name
+                -- Get model name + setter type so the server can respawn it correctly (#7)
                 local modelName = GetDisplayNameFromVehicleModel(model)
+                local vehicleType = GetVehicleType(exitedVehicle)
 
-                -- Send to server
+                -- Send to server (server re-validates ownership + sanitizes everything)
                 local vehicleData = {
                     netId = netId,
                     plate = plate,
                     model = modelName,
-                    identifier = Bridge.GetIdentifier(),
+                    vehicleType = vehicleType,
                     coords = { x = coords.x, y = coords.y, z = coords.z },
                     heading = heading,
                     props = props,
@@ -286,27 +326,35 @@ CreateThread(function()
     end
 end)
 
--- Handle vehicle destruction
+-- Handle vehicle destruction.
+-- Only report vehicles that are PERSISTED (state bag) AND owned by THIS player (#4),
+-- to stop spam/grief. The server re-validates ownership before deleting anything.
 CreateThread(function()
+    local myId = nil
     while true do
-        Wait(5000) -- Check every 5 seconds
+        Wait(10000) -- Reduced scan frequency (was 5s)
+
+        myId = myId or Bridge.GetIdentifier()
 
         local vehicles = GetGamePool('CVehicle')
         for _, vehicle in ipairs(vehicles) do
-            if DoesEntityExist(vehicle) then
-                local health = GetEntityHealth(vehicle)
-                local engineHealth = GetVehicleEngineHealth(vehicle)
+            if DoesEntityExist(vehicle) and IsVehiclePersistedLocal(vehicle) then
+                local owner = GetVehicleOwnerLocal(vehicle)
+                if owner and myId and owner == myId then
+                    local health = GetEntityHealth(vehicle)
+                    local engineHealth = GetVehicleEngineHealth(vehicle)
 
-                -- Check if vehicle is destroyed
-                if health == 0 or IsEntityDead(vehicle) or IsVehicleDriveable(vehicle) == false and engineHealth < 0 then
-                    local plate = GetVehicleNumberPlateText(vehicle)
-                    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+                    -- Check if vehicle is destroyed
+                    if health == 0 or IsEntityDead(vehicle) or (IsVehicleDriveable(vehicle) == false and engineHealth < 0) then
+                        local plate = GetVehicleNumberPlateText(vehicle)
+                        plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
 
-                    if plate and plate ~= '' then
-                        TriggerServerEvent('dps-vehiclepersistence:vehicleDestroyed', plate)
+                        if plate and plate ~= '' then
+                            TriggerServerEvent('dps-vehiclepersistence:vehicleDestroyed', plate)
 
-                        if Config.Debug then
-                            print('[dps-vehiclepersistence] Vehicle destroyed: ' .. plate)
+                            if Config.Debug then
+                                print('[dps-vehiclepersistence] Reported destroyed owned vehicle: ' .. plate)
+                            end
                         end
                     end
                 end
@@ -315,14 +363,8 @@ CreateThread(function()
     end
 end)
 
--- Server requests vehicle properties
-RegisterNetEvent('dps-vehiclepersistence:getProps', function(netId)
-    local vehicle = NetworkGetEntityFromNetworkId(netId)
-    if vehicle and DoesEntityExist(vehicle) then
-        local props = GetVehicleProperties(vehicle)
-        TriggerServerEvent('dps-vehiclepersistence:receiveProps', netId, props)
-    end
-end)
+-- NOTE: the old getProps/receiveProps round-trip was dead code (server never fired
+-- getProps and had no receiveProps handler). Restore uses requestProps -> applyProps. (#9)
 
 -- Apply vehicle properties when spawned from persistence
 RegisterNetEvent('dps-vehiclepersistence:applyProps', function(netId, props, fuel, body, engine)
@@ -358,20 +400,57 @@ RegisterNetEvent('dps-vehiclepersistence:applyProps', function(netId, props, fue
         SetVehicleEngineHealth(vehicle, engine)
     end
 
-    -- Apply fuel
+    -- Apply fuel (same detection as the read path, #13)
     if fuel then
-        local success = pcall(function()
-            exports.ox_fuel:SetFuel(vehicle, fuel)
-        end)
-        if not success then
-            pcall(function()
-                exports.LegacyFuel:SetFuel(vehicle, fuel)
-            end)
-        end
+        SetVehicleFuel(vehicle, fuel)
     end
 
     if Config.Debug then
         print('[dps-vehiclepersistence] Applied props to vehicle: ' .. netId)
+    end
+end)
+
+-- ============================================
+-- LIVE-STATE PUSH (disconnect-while-driving persistence, #12)
+-- While the owner is actively driving their vehicle, push a compact snapshot to the
+-- server every LIVE_STATE_INTERVAL. If they disconnect mid-drive, the server flushes
+-- this cached snapshot to the DB (playerDropped), fulfilling the README's
+-- "Disconnect Persistence" claim. The server re-validates ownership (cached TTL).
+-- ============================================
+CreateThread(function()
+    local LIVE_STATE_INTERVAL = 15000
+    while true do
+        Wait(LIVE_STATE_INTERVAL)
+
+        if currentVehicle and currentVehicle ~= 0 and DoesEntityExist(currentVehicle) and isOwner then
+            -- Don't push freshly garage-spawned vehicles (grace period)
+            if not IsGarageSpawned(currentVehicle) then
+                local ped = PlayerPedId()
+                -- Only when actually the driver of this vehicle
+                if GetVehiclePedIsIn(ped, false) == currentVehicle and GetPedInVehicleSeat(currentVehicle, -1) == ped then
+                    local coords = GetEntityCoords(currentVehicle)
+                    local plate = GetVehicleNumberPlateText(currentVehicle)
+                    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+
+                    TriggerServerEvent('dps-vehiclepersistence:updateLiveState', {
+                        netId = NetworkGetNetworkIdFromEntity(currentVehicle),
+                        plate = plate,
+                        model = GetDisplayNameFromVehicleModel(GetEntityModel(currentVehicle)),
+                        vehicleType = GetVehicleType(currentVehicle),
+                        coords = { x = coords.x, y = coords.y, z = coords.z },
+                        heading = GetEntityHeading(currentVehicle),
+                        props = GetVehicleProperties(currentVehicle),
+                        fuel = GetVehicleFuel(currentVehicle),
+                        body = GetVehicleBodyHealth(currentVehicle),
+                        engine = GetVehicleEngineHealth(currentVehicle)
+                    })
+
+                    if Config.Debug then
+                        print('[dps-vehiclepersistence] Pushed live state for: ' .. plate)
+                    end
+                end
+            end
+        end
     end
 end)
 
@@ -792,21 +871,26 @@ CreateThread(function()
         local vehicles = GetGamePool('CVehicle')
         local requestCount = 0
         local maxRequestsPerTick = 3 -- Batch limit to prevent server spam
+        local now = GetGameTimer()
+        local REREQUEST_COOLDOWN = 30000 -- allow a retry after 30s (failed applies self-heal)
 
         for _, vehicle in ipairs(vehicles) do
             if requestCount >= maxRequestsPerTick then break end
 
-            if DoesEntityExist(vehicle) then
+            -- Only request for PERSISTED vehicles (state bag). This is the fix for the
+            -- unbounded propsRequested growth (#10): we no longer stamp every traffic
+            -- car we drive past, only actual persisted ones that need props.
+            if DoesEntityExist(vehicle) and IsVehiclePersistedLocal(vehicle) then
                 local vehCoords = GetEntityCoords(vehicle)
                 local dist = #(coords - vehCoords)
 
-                -- Only request props within render distance
                 if dist < checkDistance then
                     local plate = GetVehicleNumberPlateText(vehicle)
                     plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
 
-                    if plate and plate ~= '' and not propsRequested[plate] then
-                        propsRequested[plate] = true
+                    local last = propsRequested[plate]
+                    if plate and plate ~= '' and (not last or (now - last) > REREQUEST_COOLDOWN) then
+                        propsRequested[plate] = now -- store timestamp, not a permanent flag
                         requestCount = requestCount + 1
                         TriggerServerEvent('dps-vehiclepersistence:requestProps', plate)
 
@@ -817,27 +901,28 @@ CreateThread(function()
                 end
             end
         end
+
+        -- Prune stale entries so the table cannot grow without bound (#10)
+        local pruneOlderThan = 120000 -- 2 minutes
+        local size = 0
+        for plate, ts in pairs(propsRequested) do
+            size = size + 1
+            if (now - ts) > pruneOlderThan then
+                propsRequested[plate] = nil
+            end
+        end
+        -- Hard cap safety valve
+        if size > 300 then
+            propsRequested = {}
+        end
     end
 end)
 
 -- ============================================
 -- STATE BAG INTEGRATION
 -- Read persistence data without server events
+-- (IsVehiclePersistedLocal / GetVehicleOwnerLocal are defined earlier in the file)
 -- ============================================
-
--- Check if vehicle is persisted using state bag (faster than server callback)
-local function IsVehiclePersistedLocal(vehicle)
-    if not vehicle or not DoesEntityExist(vehicle) then return false end
-    local state = Entity(vehicle).state
-    return state['dps:persisted'] == true
-end
-
--- Get vehicle owner from state bag
-local function GetVehicleOwnerLocal(vehicle)
-    if not vehicle or not DoesEntityExist(vehicle) then return nil end
-    local state = Entity(vehicle).state
-    return state['dps:owner']
-end
 
 -- Update vehicle damage via state bag (reduces server events)
 local function UpdateVehicleDamageStateBag(vehicle)

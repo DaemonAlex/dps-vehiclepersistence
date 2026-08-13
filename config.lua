@@ -23,8 +23,10 @@ Config.StaffGroups = {
 -- PERSISTENCE SETTINGS
 -- ═══════════════════════════════════════════════════════
 
--- How long vehicles persist after owner disconnects (minutes)
--- 0 = infinite until restart/towed
+-- Hard expiry for a parked vehicle, in MINUTES. 0 = infinite (never expire).
+-- saved_at is refreshed on every park and every live-state push, so an actively
+-- used vehicle never expires; only genuinely abandoned ones are cleaned up.
+-- Example: 1440 = expire vehicles untouched for 24h. Prevents unbounded world growth.
 Config.VehicleTimeout = 0
 
 -- Persist through server restarts
@@ -32,9 +34,6 @@ Config.PersistThroughRestart = true
 
 -- Max vehicles per player in the world
 Config.MaxVehiclesPerPlayer = 5
-
--- Min time stationary before saving (seconds)
-Config.MinStationaryTime = 30
 
 -- Spawn delay between vehicles on restart (ms)
 Config.SpawnDelay = 500
@@ -49,27 +48,13 @@ Config.GarageSpawnGracePeriod = 10000  -- 10 seconds (was hardcoded 5s)
 Config.OwnershipCacheDuration = 30
 
 -- ═══════════════════════════════════════════════════════
--- GARAGE PROXIMITY (Optional)
--- ═══════════════════════════════════════════════════════
-
-Config.GarageProximityCheck = false
-Config.GarageProximityDistance = 50.0
-
--- ═══════════════════════════════════════════════════════
 -- GARAGE INTEGRATIONS
--- Auto-detected at runtime, but can be forced here
+-- Fully event-driven (client listens for each garage system's store/spawn events).
+-- Supported (auto-detected, no config needed):
+--   qs-advancedgarages (Quasar), jg-advancedgarages (JG), qb-garages (QBCore),
+--   cd_garage (Codesign), loaf_garage (Loaf), okokGarage (okok),
+--   esx_advancedgarage (ESX)
 -- ═══════════════════════════════════════════════════════
-
-Config.GarageResource = 'auto'  -- 'auto', 'qs-advancedgarages', 'jg-advancedgarages', 'qb-garages', 'cd_garage', 'loaf_garage'
-
--- Supported garage systems (auto-detected):
--- qs-advancedgarages (Quasar)
--- jg-advancedgarages (JG Scripts)
--- qb-garages (QBCore official)
--- cd_garage (Codesign)
--- loaf_garage (Loaf)
--- okokGarage (okok)
--- esx_advancedgarage (ESX)
 
 -- ═══════════════════════════════════════════════════════
 -- VEHICLE TYPES TO PERSIST

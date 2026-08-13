@@ -5,9 +5,79 @@
 local worldVehicles = {}  -- Track vehicles in the world
 local playerVehicles = {} -- Track which vehicles belong to which player
 local vehiclePropsQueue = {} -- Queue for vehicles needing props applied
+local liveDriving = {}    -- [src] = last validated live vehicle payload while driving (for disconnect-save)
+local ownerCheckCache = {} -- [identifier|plate] = { owned = bool, t = os.time() } server-side ownership cache
+
+-- Vehicle-control coordination tables (declared here so the save path can see them)
+local jobVehicles = {}    -- [plate] = { resource, reason, timestamp } permanent exclusions
+local lockedVehicles = {} -- [plate] = { resource, locked_at } temporary locks
 
 -- Forward declarations for state bag functions
 local SetVehicleStateBag, ClearVehicleStateBag
+
+-- ============================================
+-- INPUT VALIDATION / SANITIZATION (untrusted client payloads)
+-- ============================================
+
+-- Valid CreateVehicleServerSetter types
+local VALID_VEHICLE_TYPES = {
+    automobile = true, bike = true, boat = true, heli = true, plane = true,
+    trailer = true, train = true, submarine = true, submarinecar = true,
+    quadbike = true, blimp = true, amphibious_automobile = true,
+    amphibious_quadbike = true, heli_blade = true
+}
+
+local function SanitizePlate(plate)
+    if type(plate) ~= 'string' then return nil end
+    plate = plate:gsub('^%s*(.-)%s*$', '%1')
+    if #plate == 0 or #plate > 8 then return nil end
+    if plate:match('[^%w]') then return nil end -- alphanumeric only
+    return plate
+end
+
+local function ClampNumber(v, minV, maxV, default)
+    if type(v) ~= 'number' or v ~= v then return default end -- reject non-number / NaN
+    if v < minV then return minV end
+    if v > maxV then return maxV end
+    return v
+end
+
+local function ValidateCoords(coords)
+    if type(coords) ~= 'table' then return nil end
+    local x, y, z = coords.x, coords.y, coords.z
+    if type(x) ~= 'number' or type(y) ~= 'number' or type(z) ~= 'number' then return nil end
+    if x ~= x or y ~= y or z ~= z then return nil end -- NaN
+    if math.abs(x) > 10000.0 or math.abs(y) > 10000.0 or z < -1000.0 or z > 5000.0 then return nil end
+    return { x = x + 0.0, y = y + 0.0, z = z + 0.0 }
+end
+
+-- props are re-applied to nearby players on restore, so treat as fully untrusted:
+-- must be a table, bounded key count, bounded nesting depth, no functions/threads/userdata.
+local function ValidateProps(props, depth)
+    depth = depth or 0
+    if props == nil then return {} end
+    if type(props) ~= 'table' then return nil end
+    if depth > 4 then return nil end
+    local count = 0
+    for _, v in pairs(props) do
+        count = count + 1
+        if count > 250 then return nil end
+        local tv = type(v)
+        if tv == 'table' then
+            if ValidateProps(v, depth + 1) == nil then return nil end
+        elseif tv == 'function' or tv == 'thread' or tv == 'userdata' then
+            return nil
+        end
+    end
+    return props
+end
+
+local function SanitizeVehicleType(vtype)
+    if type(vtype) == 'string' and VALID_VEHICLE_TYPES[vtype] then
+        return vtype
+    end
+    return 'automobile'
+end
 
 -- ============================================
 -- VERSION CHECKER
@@ -111,12 +181,14 @@ CreateThread(function()
         return
     end
 
-    MySQL.query([[
+    -- Await the CREATE so we never SELECT against a missing table (#6).
+    MySQL.query.await([[
         CREATE TABLE IF NOT EXISTS `dps_world_vehicles` (
             `id` INT AUTO_INCREMENT PRIMARY KEY,
             `plate` VARCHAR(8) NOT NULL,
             `citizenid` VARCHAR(50) NOT NULL,
             `model` VARCHAR(50) NOT NULL,
+            `vehicle_type` VARCHAR(24) NOT NULL DEFAULT 'automobile',
             `coords` LONGTEXT NOT NULL,
             `heading` FLOAT NOT NULL,
             `props` LONGTEXT,
@@ -128,20 +200,35 @@ CreateThread(function()
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ]])
 
+    -- Migrate older installs that predate the vehicle_type column (#7).
+    local col = MySQL.query.await([[
+        SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'dps_world_vehicles'
+          AND COLUMN_NAME = 'vehicle_type'
+    ]])
+    if not col or #col == 0 then
+        MySQL.query.await("ALTER TABLE `dps_world_vehicles` ADD COLUMN `vehicle_type` VARCHAR(24) NOT NULL DEFAULT 'automobile'")
+        if Config.Debug then
+            print('^3[dps-vehiclepersistence] Added vehicle_type column to existing table')
+        end
+    end
+
     if Config.Debug then
         print('^2[dps-vehiclepersistence] Database table initialized')
     end
 
-    -- Spawn persisted vehicles after short delay
+    -- Spawn persisted vehicles (SELECT has its own bounded retry loop, #6).
     if Config.PersistThroughRestart then
-        Wait(5000) -- Wait for server to fully start
         SpawnPersistedVehicles()
     end
 end)
 
--- Check if vehicle model is blacklisted
-local function IsBlacklisted(model)
-    local modelName = string.lower(GetDisplayNameFromVehicleModel(model) or '')
+-- Check if vehicle model is blacklisted.
+-- The client sends the resolved display/spawn name (e.g. "POLICE"), so compare directly.
+local function IsBlacklisted(modelName)
+    if type(modelName) ~= 'string' then return false end
+    modelName = string.lower(modelName)
     for _, blacklisted in ipairs(Config.BlacklistedModels) do
         if string.lower(blacklisted) == modelName then
             return true
@@ -172,9 +259,9 @@ local function IsJobBlacklisted(identifier)
     return false
 end
 
--- Check if player is staff (exempt from persistence)
-local function IsPlayerAdmin(source)
-    if not Config.AdminExempt then return false end
+-- Does this source hold admin/staff permissions? (independent of Config.AdminExempt)
+-- Used both for persistence-exemption AND as the permission gate on client-reachable events.
+local function HasAdminPerms(source)
     if not source then return false end
 
     -- Check ACE permissions (txAdmin, vMenu, etc.)
@@ -193,32 +280,50 @@ local function IsPlayerAdmin(source)
     return false
 end
 
+-- Check if player is staff (exempt from persistence saving)
+local function IsPlayerAdmin(source)
+    if not Config.AdminExempt then return false end
+    return HasAdminPerms(source)
+end
+
+-- Server-side ownership check with a short TTL cache (avoids DB spam on live updates).
+local function CachedOwnership(source, identifier, plate)
+    local key = (identifier or ('src:' .. tostring(source))) .. '|' .. plate
+    local now = os.time()
+    local cached = ownerCheckCache[key]
+    if cached and (now - cached.t) < (Config.OwnershipCacheDuration or 30) then
+        return cached.owned
+    end
+    local owned = Bridge.CheckVehicleOwnership(source, plate) and true or false
+    ownerCheckCache[key] = { owned = owned, t = now }
+    return owned
+end
+
+-- May this client mutate persistence state for `plate`? (owns it, or is admin)
+local function ClientMayMutate(source, plate)
+    if HasAdminPerms(source) then return true end
+    return Bridge.CheckVehicleOwnership(source, plate)
+end
+
 -- Callback for client to check admin status
 lib.callback.register('dps-vehiclepersistence:isAdmin', function(source)
     return IsPlayerAdmin(source)
 end)
 
--- Get vehicle properties from networked entity
-local function GetVehicleProps(netId)
-    local props = nil
-    local success = pcall(function()
-        -- Request props from client
-        local playerId = NetworkGetEntityOwner(NetworkGetEntityFromNetworkId(netId))
-        if playerId then
-            TriggerClientEvent('dps-vehiclepersistence:getProps', playerId, netId)
-        end
-    end)
-    return props
-end
-
 -- Save a single vehicle to database
 local function SaveVehicleToDB(vehicleData)
     if not vehicleData or not vehicleData.plate then return false end
 
+    -- worldVehicles entries key the owner as `identifier`; the save payload uses
+    -- `citizenid`. Accept either so the shutdown/live paths both persist correctly.
+    local ownerId = vehicleData.citizenid or vehicleData.identifier
+    if not ownerId then return false end
+
     MySQL.insert([[
-        INSERT INTO dps_world_vehicles (plate, citizenid, model, coords, heading, props, fuel, body, engine, saved_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+        INSERT INTO dps_world_vehicles (plate, citizenid, model, vehicle_type, coords, heading, props, fuel, body, engine, saved_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
         ON DUPLICATE KEY UPDATE
+            vehicle_type = VALUES(vehicle_type),
             coords = VALUES(coords),
             heading = VALUES(heading),
             props = VALUES(props),
@@ -228,8 +333,9 @@ local function SaveVehicleToDB(vehicleData)
             saved_at = NOW()
     ]], {
         vehicleData.plate,
-        vehicleData.citizenid,
+        ownerId,
         vehicleData.model,
+        vehicleData.vehicleType or 'automobile',
         json.encode(vehicleData.coords),
         vehicleData.heading,
         json.encode(vehicleData.props or {}),
@@ -255,9 +361,28 @@ end
 
 -- Spawn all persisted vehicles on server start
 function SpawnPersistedVehicles()
-    local vehicles = MySQL.query.await('SELECT * FROM dps_world_vehicles')
+    -- Bounded retry against the (remote) DB instead of a blind fixed sleep (#6).
+    local vehicles = nil
+    for attempt = 1, 6 do
+        local ok, res = pcall(function()
+            return MySQL.query.await('SELECT * FROM dps_world_vehicles')
+        end)
+        if ok and res then
+            vehicles = res
+            break
+        end
+        if Config.Debug then
+            print('^3[dps-vehiclepersistence] Initial SELECT not ready (attempt ' .. attempt .. '/6), retrying...')
+        end
+        Wait(2000)
+    end
 
-    if not vehicles or #vehicles == 0 then
+    if not vehicles then
+        print('^1[dps-vehiclepersistence] Could not load persisted vehicles from DB after retries')
+        return
+    end
+
+    if #vehicles == 0 then
         print('^2[dps-vehiclepersistence] No persisted vehicles to spawn')
         return
     end
@@ -268,10 +393,11 @@ function SpawnPersistedVehicles()
     for _, veh in ipairs(vehicles) do
         local coords = json.decode(veh.coords)
         local props = json.decode(veh.props or '{}')
+        local vehType = SanitizeVehicleType(veh.vehicle_type)
 
-        -- Spawn the vehicle
+        -- Spawn the vehicle using its stored/derived setter type (#7)
         local modelHash = joaat(veh.model)
-        local vehicle = CreateVehicleServerSetter(modelHash, 'automobile', coords.x, coords.y, coords.z, veh.heading)
+        local vehicle = CreateVehicleServerSetter(modelHash, vehType, coords.x, coords.y, coords.z, veh.heading)
 
         if vehicle and vehicle ~= 0 then
             -- Wait for entity to exist
@@ -292,11 +418,16 @@ function SpawnPersistedVehicles()
                     entity = vehicle,
                     identifier = veh.citizenid, -- citizenid column stores the identifier
                     model = veh.model,
+                    vehicleType = vehType,
                     plate = veh.plate,
+                    coords = { x = coords.x, y = coords.y, z = coords.z },
+                    heading = veh.heading,
                     fuel = veh.fuel,
                     body = veh.body,
                     engine = veh.engine,
                     props = props,
+                    -- restoredAt fallback so MaxVehiclesPerPlayer eviction can order DB-restored rows (#11)
+                    savedAt = os.time(),
                     needsProps = true
                 }
                 worldVehicles[veh.plate] = vehicleData
@@ -368,39 +499,74 @@ RegisterNetEvent('dps-vehiclepersistence:vehicleEntered', function(netId, plate,
     end
 end)
 
--- Handle player exiting a vehicle
-RegisterNetEvent('dps-vehiclepersistence:vehicleExited', function(vehicleData)
-    if Config.Enabled == false then return end
-    local src = source
-    if IsPlayerAdmin(src) then return end -- Admin exempt
+-- Validate + sanitize an untrusted client vehicle payload (#2). Server-authoritative:
+-- returns a clean table or nil. `useCache` uses the short-TTL ownership cache (live updates).
+local function ValidateVehiclePayload(src, vehicleData, useCache)
+    if type(vehicleData) ~= 'table' then return nil end
 
     local identifier = Bridge.GetIdentifier(src)
-    if not identifier then return end
+    if not identifier then return nil end
 
-    -- Check if player owns this vehicle (client sends identifier)
-    if vehicleData.identifier ~= identifier then return end
+    local plate = SanitizePlate(vehicleData.plate)
+    if not plate then return nil end
 
-    -- Check blacklists
-    if IsBlacklisted(vehicleData.model) then return end
-    if IsJobBlacklisted(identifier) then return end
+    -- SERVER-SIDE ownership check — never trust the client's identifier field (#2)
+    local owns
+    if useCache then
+        owns = CachedOwnership(src, identifier, plate)
+    else
+        owns = Bridge.CheckVehicleOwnership(src, plate)
+    end
+    if not owns then return nil end
 
-    -- Count player's world vehicles
+    -- Exclusion / lock guard (job vehicles, rentals, active tow/mechanic work)
+    if jobVehicles[plate] or lockedVehicles[plate] then return nil end
+
+    local model = vehicleData.model
+    if type(model) ~= 'string' or #model == 0 or #model > 50 then return nil end
+
+    if IsBlacklisted(model) then return nil end
+    if IsJobBlacklisted(identifier) then return nil end
+
+    local coords = ValidateCoords(vehicleData.coords)
+    if not coords then return nil end
+
+    local props = ValidateProps(vehicleData.props)
+    if props == nil then return nil end -- explicit table check; {} is valid
+
+    return {
+        plate = plate,
+        citizenid = identifier,      -- always server-derived
+        identifier = identifier,
+        model = model,
+        vehicleType = SanitizeVehicleType(vehicleData.vehicleType),
+        netId = vehicleData.netId,
+        coords = coords,
+        heading = ClampNumber(vehicleData.heading, -360.0, 360.0, 0.0),
+        props = props,
+        fuel = ClampNumber(vehicleData.fuel, 0.0, 100.0, 100.0),
+        body = ClampNumber(vehicleData.body, 0.0, 1000.0, 1000.0),
+        engine = ClampNumber(vehicleData.engine, -4000.0, 1000.0, 1000.0)
+    }
+end
+
+-- Enforce MaxVehiclesPerPlayer by evicting the oldest tracked world vehicle for this owner.
+local function EnforceVehicleLimit(identifier, excludePlate)
     local count = 0
-    for plate, veh in pairs(worldVehicles) do
+    for _, veh in pairs(worldVehicles) do
         if veh.identifier == identifier and not veh.beingDriven then
             count = count + 1
         end
     end
 
-    -- Check max vehicles limit
-    if count >= Config.MaxVehiclesPerPlayer then
-        -- Remove oldest vehicle
-        local oldest = nil
-        local oldestTime = math.huge
+    if count >= (Config.MaxVehiclesPerPlayer or 5) then
+        local oldest, oldestTime = nil, math.huge
         for plate, veh in pairs(worldVehicles) do
-            if veh.identifier == identifier and veh.savedAt and veh.savedAt < oldestTime then
-                oldest = plate
-                oldestTime = veh.savedAt
+            if veh.identifier == identifier and plate ~= excludePlate then
+                local t = veh.savedAt or 0
+                if t < oldestTime then
+                    oldest, oldestTime = plate, t
+                end
             end
         end
         if oldest then
@@ -408,45 +574,71 @@ RegisterNetEvent('dps-vehiclepersistence:vehicleExited', function(vehicleData)
             worldVehicles[oldest] = nil
         end
     end
+end
 
-    -- Track this vehicle
-    worldVehicles[vehicleData.plate] = {
-        netId = vehicleData.netId,
-        identifier = identifier,
-        model = vehicleData.model,
-        plate = vehicleData.plate,
-        coords = vehicleData.coords,
-        heading = vehicleData.heading,
-        props = vehicleData.props,
-        fuel = vehicleData.fuel,
-        body = vehicleData.body,
-        engine = vehicleData.engine,
+-- Persist a validated payload to memory + DB (shared by exit-save and disconnect-save).
+local function PersistWorldVehicle(clean)
+    EnforceVehicleLimit(clean.identifier, clean.plate)
+
+    worldVehicles[clean.plate] = {
+        netId = clean.netId,
+        identifier = clean.identifier,
+        model = clean.model,
+        vehicleType = clean.vehicleType,
+        plate = clean.plate,
+        coords = clean.coords,
+        heading = clean.heading,
+        props = clean.props,
+        fuel = clean.fuel,
+        body = clean.body,
+        engine = clean.engine,
         savedAt = os.time(),
         beingDriven = false
     }
 
-    -- Save to database (uses citizenid column for QB compat)
-    local dbData = {
-        plate = vehicleData.plate,
-        citizenid = identifier, -- Column name in DB
-        model = vehicleData.model,
-        coords = vehicleData.coords,
-        heading = vehicleData.heading,
-        props = vehicleData.props,
-        fuel = vehicleData.fuel,
-        body = vehicleData.body,
-        engine = vehicleData.engine
-    }
-    SaveVehicleToDB(dbData)
+    SaveVehicleToDB(clean) -- clean.citizenid is the server-derived identifier
+end
+
+-- Handle player exiting a vehicle
+RegisterNetEvent('dps-vehiclepersistence:vehicleExited', function(vehicleData)
+    if Config.Enabled == false then return end
+    local src = source
+    if IsPlayerAdmin(src) then return end -- Admin exempt
+
+    local clean = ValidateVehiclePayload(src, vehicleData, false)
+    if not clean then return end
+
+    liveDriving[src] = nil -- they parked it; no longer "driving"
+    PersistWorldVehicle(clean)
 
     if Config.Debug then
-        print('^2[dps-vehiclepersistence] Vehicle parked: ' .. vehicleData.plate .. ' by ' .. identifier)
+        print('^2[dps-vehiclepersistence] Vehicle parked: ' .. clean.plate .. ' by ' .. clean.identifier)
     end
 end)
 
--- Handle vehicle stored in garage
+-- Live state push while driving an owned vehicle. Cached so a disconnect mid-drive
+-- still persists the vehicle (#12). Ownership is verified (cached TTL) so this cannot
+-- be used to inject an arbitrary plate.
+RegisterNetEvent('dps-vehiclepersistence:updateLiveState', function(vehicleData)
+    if Config.Enabled == false then return end
+    local src = source
+    if IsPlayerAdmin(src) then return end
+
+    local clean = ValidateVehiclePayload(src, vehicleData, true)
+    if not clean then return end
+
+    liveDriving[src] = clean
+end)
+
+-- Handle vehicle stored in garage (removes from world persistence).
+-- Client-reachable → must own the plate or be admin (#3).
 RegisterNetEvent('dps-vehiclepersistence:vehicleStored', function(plate)
     if Config.Enabled == false then return end
+    local src = source
+    plate = SanitizePlate(plate)
+    if not plate then return end
+    if not ClientMayMutate(src, plate) then return end
+
     if worldVehicles[plate] then
         RemoveVehicleFromDB(plate)
         worldVehicles[plate] = nil
@@ -461,13 +653,19 @@ end)
 AddEventHandler('playerDropped', function(reason)
     local src = source
     local identifier = Bridge.GetIdentifier(src)
-    if not identifier then return end
 
-    -- Save all vehicles the player was near/driving
-    if playerVehicles[identifier] then
-        for plate, netId in pairs(playerVehicles[identifier]) do
-            -- Vehicle will be tracked by world vehicles system
-            -- Mark as no longer being driven
+    -- Disconnect-while-driving persistence (#12): flush the last validated live payload.
+    local live = liveDriving[src]
+    if live then
+        PersistWorldVehicle(live)
+        liveDriving[src] = nil
+        if Config.Debug then
+            print('^2[dps-vehiclepersistence] Disconnect-saved driven vehicle: ' .. live.plate)
+        end
+    end
+
+    if identifier and playerVehicles[identifier] then
+        for plate, _ in pairs(playerVehicles[identifier]) do
             if worldVehicles[plate] then
                 worldVehicles[plate].beingDriven = false
             end
@@ -475,27 +673,44 @@ AddEventHandler('playerDropped', function(reason)
         playerVehicles[identifier] = nil
     end
 
-    if Config.Debug then
+    -- Drop this player's cached ownership entries
+    if identifier then
+        local prefix = identifier .. '|'
+        for key in pairs(ownerCheckCache) do
+            if key:sub(1, #prefix) == prefix then
+                ownerCheckCache[key] = nil
+            end
+        end
+    end
+
+    if Config.Debug and identifier then
         print('^3[dps-vehiclepersistence] Player disconnected: ' .. identifier)
     end
 end)
 
--- Handle vehicle destroyed/deleted
+-- Handle vehicle destroyed/deleted. Client-reachable → must own the plate or be admin (#3, #4).
 RegisterNetEvent('dps-vehiclepersistence:vehicleDestroyed', function(plate)
     if Config.Enabled == false then return end
-    if worldVehicles[plate] then
-        RemoveVehicleFromDB(plate)
-        worldVehicles[plate] = nil
+    local src = source
+    plate = SanitizePlate(plate)
+    if not plate then return end
+    if not worldVehicles[plate] then return end
+    if not ClientMayMutate(src, plate) then return end
 
-        if Config.Debug then
-            print('^1[dps-vehiclepersistence] Vehicle destroyed: ' .. plate)
-        end
+    RemoveVehicleFromDB(plate)
+    worldVehicles[plate] = nil
+
+    if Config.Debug then
+        print('^1[dps-vehiclepersistence] Vehicle destroyed: ' .. plate)
     end
 end)
 
 -- Tow/impound a vehicle (removes from persistence)
 RegisterNetEvent('dps-vehiclepersistence:towVehicle', function(plate)
     local src = source
+    plate = SanitizePlate(plate)
+    if not plate then return end
+
     local job = Bridge.GetPlayerJob(src)
     if not job then return end
 
@@ -565,6 +780,70 @@ AddEventHandler('txAdmin:events:serverShuttingDown', function()
     end
 
     print('^2[dps-vehiclepersistence] Saved ' .. saved .. ' vehicles before shutdown')
+end)
+
+-- Delete all spawned world-vehicle entities when THIS resource stops (#5).
+-- Without this, a restart reloads every DB row while the previously-spawned entities
+-- linger, so duplicates accumulate on each restart.
+AddEventHandler('onResourceStop', function(resourceName)
+    if resourceName ~= GetCurrentResourceName() then return end
+
+    local deleted = 0
+    for _, veh in pairs(worldVehicles) do
+        local ent = veh.entity
+        if (not ent or ent == 0 or not DoesEntityExist(ent)) and veh.netId then
+            ent = NetworkGetEntityFromNetworkId(veh.netId)
+        end
+        if ent and ent ~= 0 and DoesEntityExist(ent) then
+            DeleteEntity(ent)
+            deleted = deleted + 1
+        end
+    end
+
+    if deleted > 0 then
+        print('^3[dps-vehiclepersistence] Cleaned up ' .. deleted .. ' spawned entities on resource stop')
+    end
+end)
+
+-- ============================================
+-- VEHICLE TIMEOUT (hard expiry of stale parked vehicles) (#16)
+-- Config.VehicleTimeout is in MINUTES; 0 = infinite. A vehicle's saved_at is
+-- refreshed every park/live-update, so only genuinely abandoned vehicles expire.
+-- ============================================
+CreateThread(function()
+    if Config.Enabled == false then return end
+    if not Config.VehicleTimeout or Config.VehicleTimeout <= 0 then return end
+
+    local timeoutMinutes = Config.VehicleTimeout
+    local checkInterval = math.max(60000, math.min(timeoutMinutes * 60000, 300000)) -- 1-5 min cadence
+
+    while true do
+        Wait(checkInterval)
+
+        local expired = MySQL.query.await([[
+            SELECT plate FROM dps_world_vehicles
+            WHERE saved_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)
+        ]], { timeoutMinutes })
+
+        if expired and #expired > 0 then
+            for _, row in ipairs(expired) do
+                local plate = row.plate
+                local veh = worldVehicles[plate]
+                if veh then
+                    local ent = veh.entity
+                    if (not ent or ent == 0 or not DoesEntityExist(ent)) and veh.netId then
+                        ent = NetworkGetEntityFromNetworkId(veh.netId)
+                    end
+                    if ent and ent ~= 0 and DoesEntityExist(ent) then
+                        DeleteEntity(ent)
+                    end
+                    worldVehicles[plate] = nil
+                end
+                RemoveVehicleFromDB(plate)
+            end
+            print('^3[dps-vehiclepersistence] Expired ' .. #expired .. ' parked vehicles past VehicleTimeout (' .. timeoutMinutes .. ' min)')
+        end
+    end
 end)
 
 -- ============================================
@@ -753,10 +1032,9 @@ end)
 -- VEHICLE CONTROL COORDINATION
 -- Any script that controls vehicles should use these
 -- to prevent conflicts with persistence
+-- (jobVehicles / lockedVehicles are declared at the top of the file so the
+--  save path can consult them.)
 -- ============================================
-
-local jobVehicles = {} -- [plate] = { resource, reason, timestamp }
-local lockedVehicles = {} -- [plate] = { resource, locked_at } - temporarily locked from persistence
 
 -- ═══════════════════════════════════════════════════════
 -- EXCLUSION SYSTEM (Permanent - for job vehicles, rentals, etc.)
@@ -885,26 +1163,52 @@ exports('GetVehicleStatus', function(plate)
     }
 end)
 
--- Event versions for client-side use
+-- ═══════════════════════════════════════════════════════
+-- CLIENT-REACHABLE EVENT MIRRORS (#3)
+-- Other RESOURCES should call the exports above (server-to-server, trusted).
+-- These net mirrors exist for client-side integrations (rentals, admin menus),
+-- so every one is gated: the source must OWN the plate or be an admin. Without
+-- this gate any client could exclude/lock/DELETE any player's persisted vehicle.
+-- ═══════════════════════════════════════════════════════
 RegisterNetEvent('dps-vehiclepersistence:excludeVehicle', function(plate, reason)
     local src = source
-    exports['dps-vehiclepersistence']:ExcludeFromPersistence(plate, GetInvokingResource() or 'client', reason)
+    plate = SanitizePlate(plate)
+    if not plate then return end
+    if not ClientMayMutate(src, plate) then return end
+    exports['dps-vehiclepersistence']:ExcludeFromPersistence(plate, 'client', type(reason) == 'string' and reason or 'client')
 end)
 
 RegisterNetEvent('dps-vehiclepersistence:removeExclusion', function(plate)
+    local src = source
+    plate = SanitizePlate(plate)
+    if not plate then return end
+    if not ClientMayMutate(src, plate) then return end
     exports['dps-vehiclepersistence']:RemoveExclusion(plate)
 end)
 
 RegisterNetEvent('dps-vehiclepersistence:lockVehicle', function(plate)
-    exports['dps-vehiclepersistence']:LockVehicle(plate, GetInvokingResource() or 'client')
+    local src = source
+    plate = SanitizePlate(plate)
+    if not plate then return end
+    if not ClientMayMutate(src, plate) then return end
+    exports['dps-vehiclepersistence']:LockVehicle(plate, 'client')
 end)
 
 RegisterNetEvent('dps-vehiclepersistence:unlockVehicle', function(plate)
+    local src = source
+    plate = SanitizePlate(plate)
+    if not plate then return end
+    if not ClientMayMutate(src, plate) then return end
     exports['dps-vehiclepersistence']:UnlockVehicle(plate)
 end)
 
 RegisterNetEvent('dps-vehiclepersistence:notifyHandled', function(plate, action)
-    exports['dps-vehiclepersistence']:NotifyVehicleHandled(plate, action, GetInvokingResource() or 'client')
+    local src = source
+    plate = SanitizePlate(plate)
+    if not plate then return end
+    -- 'deleted'/'stored'/'impounded' all call RemoveVehicleFromDB — must own or be admin.
+    if not ClientMayMutate(src, plate) then return end
+    exports['dps-vehiclepersistence']:NotifyVehicleHandled(plate, action, 'client')
 end)
 
 -- Auto-cleanup stale locks (5 minute timeout)

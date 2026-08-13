@@ -2,7 +2,7 @@
 
 Realistic vehicle world persistence system for FiveM servers. Vehicles stay where you park them - just like real life.
 
-**Version:** 2.0.0
+**Version:** 2.2.0
 **Framework:** QB-Core / QBX / ESX (auto-detected)
 
 ## Features
@@ -73,14 +73,12 @@ Config.AdminExempt = true
 Config.StaffGroups = { 'admin', 'god', 'superadmin', 'mod', 'dev' }
 
 -- Persistence Settings
-Config.VehicleTimeout = 0  -- Minutes (0 = infinite)
+Config.VehicleTimeout = 0  -- Minutes untouched before expiry (0 = infinite)
 Config.PersistThroughRestart = true
 Config.MaxVehiclesPerPlayer = 5
-Config.MinStationaryTime = 30  -- Seconds
 Config.SpawnDelay = 500  -- MS between spawns on restart
 
--- Garage Integration (auto-detected)
-Config.GarageResource = 'auto'
+-- Garage Integration is fully event-driven / auto-detected (no config key)
 
 -- Orphaned Vehicle Cleanup
 Config.OrphanedVehicles = {
@@ -196,6 +194,7 @@ CREATE TABLE IF NOT EXISTS `dps_world_vehicles` (
     `plate` VARCHAR(8) NOT NULL,
     `citizenid` VARCHAR(50) NOT NULL,
     `model` VARCHAR(50) NOT NULL,
+    `vehicle_type` VARCHAR(24) NOT NULL DEFAULT 'automobile',
     `coords` LONGTEXT NOT NULL,
     `heading` FLOAT NOT NULL,
     `props` LONGTEXT,
@@ -208,6 +207,8 @@ CREATE TABLE IF NOT EXISTS `dps_world_vehicles` (
     INDEX `idx_saved_at` (`saved_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
+
+> The `vehicle_type` column is added automatically on start for existing installs (used to respawn boats/helis/planes/bikes/trailers with the correct physics type).
 
 ## Fuel System Compatibility
 
@@ -264,6 +265,21 @@ Auto-detects and works with:
 - Check if admin-spawned vehicles are being excluded
 
 ## Changelog
+
+### v2.2.0
+- **QBX fix:** bridge no longer calls `GetCoreObject()` on qbx (this qbx_core build has none). QBX now uses discrete exports (`qbx_core:GetPlayer` / `GetPlayerByCitizenId` / `GetPlayerData`) and `lib.addCommand` for admin commands. Resource now starts on pure Qbox.
+- **Security:** the save path is now server-authoritative — server-side ownership check + full sanitization (plate, coords bounds, fuel/body/engine clamps, untrusted props validation) before any DB write.
+- **Security:** all client-reachable net events (`vehicleStored`, `vehicleDestroyed`, `excludeVehicle`, `removeExclusion`, `lockVehicle`, `unlockVehicle`, `notifyHandled`) now require the caller to own the plate or hold admin perms. Closes remote wipe/exclude griefing.
+- **Restart dedupe:** added `onResourceStop` cleanup that deletes all spawned entities, preventing duplicate accumulation across restarts.
+- **Cold-boot:** awaited CREATE TABLE + bounded retry on the initial SELECT (no more blind 5s sleep against the remote DB).
+- **Vehicle types:** boats/helis/planes/bikes/trailers now respawn with the correct physics type (stored in new `vehicle_type` column).
+- **Disconnect persistence:** vehicles are now saved even if the owner disconnects while driving (live-state cache flushed on drop).
+- **Destroy scan:** now only reports persisted, owner-owned vehicles (server re-validates); scan interval raised to 10s.
+- **Fuel:** read and apply now use one shared detection path and honor `Config.FuelResource`.
+- Fixed `MaxVehiclesPerPlayer` eviction for restart-restored vehicles; fixed unbounded `propsRequested` growth; fixed model blacklist matching.
+- Implemented `Config.VehicleTimeout` (hard expiry of abandoned parked vehicles).
+- Removed dead config keys (`MinStationaryTime`, `GarageProximityCheck/Distance`, `GarageResource`) and dead prop round-trip code.
+- Aligned repository URL to `DaemonAlex/dps-vehiclepersistence`.
 
 ### v2.0.0
 - Multi-framework support (QB/QBX/ESX)

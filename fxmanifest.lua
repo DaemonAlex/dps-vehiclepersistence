@@ -5,8 +5,8 @@ lua54 'yes'
 name 'dps-vehiclepersistence'
 author 'DPSRP'
 description 'Realistic vehicle world persistence - vehicles stay where parked'
-version '2.1.0'
-repository 'https://github.com/DeamonScripts/dps-vehiclepersistence'
+version '2.2.0'
+repository 'https://github.com/DaemonAlex/dps-vehiclepersistence'
 
 shared_scripts {
     '@ox_lib/init.lua',
