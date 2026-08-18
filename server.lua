@@ -6,6 +6,20 @@ local worldVehicles = {}  -- Track vehicles in the world
 local playerVehicles = {} -- Track which vehicles belong to which player
 local vehiclePropsQueue = {} -- Queue for vehicles needing props applied
 local liveDriving = {}    -- [src] = last validated live vehicle payload while driving (for disconnect-save)
+local srcIdentifiers = {} -- [src] = identifier, cached so playerDropped can still resolve it
+
+-- Drop any cached live-driving payload for a plate. Storing a vehicle from inside
+-- it deletes the entity, so the client never fires vehicleExited and the payload
+-- stayed cached; the disconnect flush then re-inserted the row and the car existed
+-- in the world AND in the garage. Called from RemoveVehicleFromDB so every removal
+-- path (stored / destroyed / towed / excluded / admin) is covered.
+local function InvalidateLiveDriving(plate)
+    for s, live in pairs(liveDriving) do
+        if live and live.plate == plate then
+            liveDriving[s] = nil
+        end
+    end
+end
 local ownerCheckCache = {} -- [identifier|plate] = { owned = bool, t = os.time() } server-side ownership cache
 
 -- Vehicle-control coordination tables (declared here so the save path can see them)
@@ -353,6 +367,7 @@ end
 
 -- Remove vehicle from database
 local function RemoveVehicleFromDB(plate)
+    InvalidateLiveDriving(plate)
     MySQL.query('DELETE FROM dps_world_vehicles WHERE plate = ?', {plate})
     if Config.Debug then
         print('^1[dps-vehiclepersistence] Removed vehicle from DB: ' .. plate)
@@ -477,13 +492,24 @@ RegisterNetEvent('dps-vehiclepersistence:requestProps', function(plate)
 end)
 
 -- Handle player entering a vehicle
-RegisterNetEvent('dps-vehiclepersistence:vehicleEntered', function(netId, plate, isOwner)
+RegisterNetEvent('dps-vehiclepersistence:vehicleEntered', function(netId, plate, _clientIsOwner)
     if Config.Enabled == false then return end
     local src = source
     if IsPlayerAdmin(src) then return end -- Admin exempt
 
     local identifier = Bridge.GetIdentifier(src)
     if not identifier then return end
+    srcIdentifiers[src] = identifier
+
+    -- The plate and the ownership flag both came from the client. An arbitrary
+    -- plate marked isOwner=true was recorded as beingDriven, which excludes it
+    -- from the shutdown save and from EnforceVehicleLimit - a way to bypass
+    -- MaxVehiclesPerPlayer - and grew playerVehicles unboundedly. Sanitise the
+    -- plate and resolve ownership on the server instead.
+    plate = SanitizePlate(plate)
+    if not plate then return end
+
+    local isOwner = ClientMayMutate(src, plate)
 
     -- If this is the owner's vehicle, track it
     if isOwner then
@@ -627,6 +653,7 @@ RegisterNetEvent('dps-vehiclepersistence:updateLiveState', function(vehicleData)
     local clean = ValidateVehiclePayload(src, vehicleData, true)
     if not clean then return end
 
+    srcIdentifiers[src] = clean.identifier
     liveDriving[src] = clean
 end)
 
@@ -652,10 +679,20 @@ end)
 -- Handle player disconnect
 AddEventHandler('playerDropped', function(reason)
     local src = source
-    local identifier = Bridge.GetIdentifier(src)
+    -- qb/qbx/esx remove the player object in their OWN playerDropped handler,
+    -- which runs first, so Bridge.GetIdentifier returned nil here and every
+    -- cleanup below was dead code. Fall back to the cached identifier.
+    local identifier = Bridge.GetIdentifier(src) or srcIdentifiers[src]
 
     -- Disconnect-while-driving persistence (#12): flush the last validated live payload.
     local live = liveDriving[src]
+    -- Only flush a vehicle still tracked as a world vehicle; if it was stored,
+    -- destroyed, towed or excluded since the payload was cached, re-persisting
+    -- it would duplicate the car.
+    if live and not worldVehicles[live.plate] then
+        liveDriving[src] = nil
+        live = nil
+    end
     if live then
         PersistWorldVehicle(live)
         liveDriving[src] = nil
@@ -663,6 +700,8 @@ AddEventHandler('playerDropped', function(reason)
             print('^2[dps-vehiclepersistence] Disconnect-saved driven vehicle: ' .. live.plate)
         end
     end
+
+    srcIdentifiers[src] = nil
 
     if identifier and playerVehicles[identifier] then
         for plate, _ in pairs(playerVehicles[identifier]) do
