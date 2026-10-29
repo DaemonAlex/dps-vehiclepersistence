@@ -64,8 +64,8 @@ Config.PersistTypes = {
     'automobile',
     'bike',
     'boat',
-    'heli',
-    'plane',
+    -- 'heli', -- DPS 2026-10-29 (Damon yes): MS FlightSim owns aircraft (rentals, clean-up, AI planes)
+    -- 'plane', -- DPS 2026-10-29 (Damon yes): MS FlightSim owns aircraft (rentals, clean-up, AI planes)
     'quadbike',
     'trailer'
 }
