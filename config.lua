@@ -105,8 +105,8 @@ Config.BlacklistedModels = {
 -- ═══════════════════════════════════════════════════════
 
 Config.BlacklistedJobs = { -- DPS 2026-09-25: every emergency fleet + service jobs (vendor list had sheriff/sahp/lspd/ambulance/ems/fire)
-    'police', 'bcso', 'sasp', 'fib', 'doc', 'dfw', 'rpd', 'rcso', 'uscg', 'natguard',
-    'sams', 'omc', 'rmc', 'lsfd', 'rfd',
+    'police', 'bcso', 'sasp', 'fib', 'doc', 'dfw', 'uscg', 'natguard',
+    'sams', 'lsmc', 'lsfd', 
     'mechanic', 'tow',
     'taxi', 'bus',
 }
@@ -140,7 +140,7 @@ Config.OrphanedVehicles = {
 -- ═══════════════════════════════════════════════════════
 
 Config.TowJobs = { -- DPS 2026-09-25: patrol set + tow/mechanic
-    'police', 'bcso', 'sasp', 'rpd', 'rcso',
+    'police', 'bcso', 'sasp', 
     'tow', 'mechanic'
 }
 

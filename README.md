@@ -5,6 +5,10 @@ Realistic vehicle world persistence system for FiveM servers. Vehicles stay wher
 **Version:** 2.2.0
 **Framework:** QB-Core / QBX / ESX (auto-detected)
 
+## What it is for
+
+In stock FiveM a car left on the street is gone after a server restart, and often sooner. Players then store every car in a garage before they log off, or ask staff where their car went. This script keeps an owned vehicle where the player parked it, with its mods, fuel and damage, through a disconnect and through a restart.
+
 ## Features
 
 - **Disconnect Persistence** - Vehicles remain in the world when owners disconnect
@@ -17,6 +21,22 @@ Realistic vehicle world persistence system for FiveM servers. Vehicles stay wher
 - **State Bags** - Efficient synchronization using FiveM's state bag system
 - **Orphaned Cleanup** - Auto-impound or delete abandoned vehicles
 - **Admin Exempt** - Staff vehicles don't persist (configurable)
+
+## On its own, and with other scripts
+
+**On its own.** With `ox_lib`, `oxmysql` and a framework, owned cars, bikes, boats, quads and trailers stay where they were parked. They come back after a restart with mods, fuel and damage. Each player can have 5 vehicles in the world. Job vehicles and staff vehicles are left out. A vehicle whose owner has not been on for 7 days goes to the impound.
+
+**With a paid garage (jg-advancedgarages, qs-advancedgarages, cd_garage, loaf_garage, okokGarage).** When a player stores a car in the garage, it leaves the world list, so it does not also spawn in the street at the next restart. When a player takes a car out, a short grace period stops it being saved before the player gets in. The script only listens for the garage's store and spawn events. It calls nothing in the garage and writes nothing to it, so a garage update does not break it.
+
+**With a paid dealership or mechanic (jg-dealerships, qs-dealership, jg-mechanic, qs-mechanicjob).** A newly bought car gets the same short grace period as a car taken out of a garage. A car left at a mechanic shop leaves the world list. Again the script only listens for their events.
+
+**With a fuel script (ox_fuel, LegacyFuel, cdn-fuel, ps-fuel).** The saved fuel level is read from, and put back through, the fuel script that is running. With none, the game's own fuel level is used.
+
+**With [dps-parking](https://github.com/DaemonAlex/dps-parking).** dps-parking reads the list of parked vehicles from this script through its exports. It can also remove a vehicle from the list when it handles one.
+
+**With [dps-towjob](https://github.com/DaemonAlex/dps-towjob).** A towed car is handed to the garage or the impound, and dps-towjob tells this script the car was handled. The car then does not spawn in the street again at the next restart.
+
+**With your own scripts.** Use the lock and exclude exports below for rentals, job vehicles and anything else that should not stay in the world.
 
 ## Requirements
 
@@ -43,13 +63,13 @@ Realistic vehicle world persistence system for FiveM servers. Vehicles stay wher
 ### Garage Systems
 | System | Status |
 |--------|--------|
-| qs-advancedgarages (Quasar) | ✅ Full Support |
-| jg-advancedgarages (JG Scripts) | ✅ Full Support |
-| qb-garages (QBCore) | ✅ Full Support |
-| cd_garage (Codesign) | ✅ Full Support |
-| loaf_garage (Loaf) | ✅ Full Support |
-| okokGarage (okok) | ✅ Full Support |
-| esx_advancedgarage (ESX) | ✅ Full Support |
+| qs-advancedgarages (Quasar) | Full support |
+| jg-advancedgarages (JG Scripts) | Full support |
+| qb-garages (QBCore) | Full support |
+| cd_garage (Codesign) | Full support |
+| loaf_garage (Loaf) | Full support |
+| okokGarage (okok) | Full support |
+| esx_advancedgarage (ESX) | Full support |
 
 ### Other Integrations
 - **Dealerships:** jg-dealerships, qs-dealership, qb-vehicleshop
@@ -91,7 +111,18 @@ Config.OrphanedVehicles = {
 }
 
 -- Tow Job Permissions
-Config.TowJobs = { 'police', 'sheriff', 'tow', 'mechanic' }
+Config.TowJobs = { 'police', 'bcso', 'sasp', 'tow', 'mechanic' }
+
+-- Jobs whose vehicles never persist
+Config.BlacklistedJobs = {
+    'police', 'bcso', 'sasp', 'fib', 'doc', 'dfw', 'uscg', 'natguard',
+    'sams', 'lsmc', 'lsfd',
+    'mechanic', 'tow',
+    'taxi', 'bus',
+}
+
+-- Vehicle types that persist (helicopters and planes are off)
+Config.PersistTypes = { 'automobile', 'bike', 'boat', 'quadbike', 'trailer' }
 
 -- Fuel System (auto-detected)
 Config.FuelResource = 'auto'
@@ -208,7 +239,7 @@ CREATE TABLE IF NOT EXISTS `dps_world_vehicles` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
-> The `vehicle_type` column is added automatically on start for existing installs (used to respawn boats/helis/planes/bikes/trailers with the correct physics type).
+> The `vehicle_type` column is added automatically on start for existing installs (used to respawn boats/helis/planes/bikes/trailers with the correct physics type). Helicopters and planes are switched off in `Config.PersistTypes` since 29 October 2026.
 
 ## Fuel System Compatibility
 
@@ -266,6 +297,13 @@ Auto-detects and works with:
 
 ## Changelog
 
+### Recent changes
+
+- **12 November 2026.** README: what it is for, how it works alone and with paid scripts, other DPS scripts.
+- **31 October 2026.** Job lists updated after the Roxwood map and its departments left the server. `rpd`, `rcso`, `rfd`, `omc` and `rmc` are gone from `Config.BlacklistedJobs` and `Config.TowJobs`. The hospital job is `lsmc`.
+- **29 October 2026.** Helicopters and planes no longer persist. The flight script on the server owns aircraft, and keeping them in place fought its clean-up. Cars, bikes, boats, quads and trailers still persist.
+- **25 September 2026.** `Config.BlacklistedJobs` and `Config.TowJobs` use the server's real job names. The vendor names (`sheriff`, `sahp`, `lspd`, `ambulance`, `ems`, `fire`) are removed.
+
 ### v2.2.0
 - **QBX fix:** bridge no longer calls `GetCoreObject()` on qbx (this qbx_core build has none). QBX now uses discrete exports (`qbx_core:GetPlayer` / `GetPlayerByCitizenId` / `GetPlayerData`) and `lib.addCommand` for admin commands. Resource now starts on pure Qbox.
 - **Security:** the save path is now server-authoritative — server-side ownership check + full sanitization (plate, coords bounds, fuel/body/engine clamps, untrusted props validation) before any DB write.
@@ -300,9 +338,41 @@ Auto-detects and works with:
 
 This resource is provided for use on DPSRP servers. Feel free to modify for your own use.
 
+## Author
+
+Made by [DaemonAlex](https://github.com/DaemonAlex) for DelPerroSands.
+
 ## Credits
 
 - DaemonAlex
 - DPSRP Development Team
 - QBCore/ESX Framework Teams
 - Overextended (ox_lib, oxmysql)
+
+## Other DPS scripts
+
+All of these are made for DelPerroSands and run together on one Qbox server. Each one works on
+its own. The ones marked "pairs with" do more when both are running.
+
+| Script | What it does |
+|---|---|
+| [dps-inventory](https://github.com/DaemonAlex/dps-inventory) | The inventory: ox_inventory with equipment slots, backpacks, armour plates and a self status panel, in the DelPerroSands colours. |
+| [dps-medical](https://github.com/DaemonAlex/dps-medical) | Patient records, illness and diagnostic tests. A companion to wasabi_ambulance. Pairs with dps-inventory: symptoms and diagnoses show on the status panel. |
+| [dps-insurance](https://github.com/DaemonAlex/dps-insurance) | Ties m-Insurance into the MDT, impound, hospital and medical chart. Pairs with dps-medical. |
+| [dps-studio](https://github.com/DaemonAlex/dps-studio) | Build rooms, doors and portals in game from one panel (`/studio`), with owners and managers so staff do not have to support them. |
+| [dps-shops](https://github.com/DaemonAlex/dps-shops) | Shop clerks who greet and react to a robbery, then player-owned shops. |
+| [dps-fleet](https://github.com/DaemonAlex/dps-fleet) | Vehicle browser and workshop on one panel: extras, liveries and mods for emergency vehicles. |
+| [dps-parking](https://github.com/DaemonAlex/dps-parking) | Parking with valet, impound, violations and reserved spots. |
+| [dps-towjob](https://github.com/DaemonAlex/dps-towjob) | Queue-based tow job with jg-mechanic integration. |
+| [dps-services](https://github.com/DaemonAlex/dps-services) | Request a tow and follow it live on the lb-phone and lb-tablet. Pairs with dps-towjob. |
+| [dps-autoshops](https://github.com/DaemonAlex/dps-autoshops) | Self-service repair shops when no mechanic is on duty. |
+| [dps-cityworker](https://github.com/DaemonAlex/dps-cityworker) | City infrastructure job and career. |
+| [dps-ainpcs](https://github.com/DaemonAlex/dps-ainpcs) | NPCs you can talk to, with trust, quests and intel. |
+| [dps-badpeds](https://github.com/DaemonAlex/dps-badpeds) | Police interaction with NPCs: stops, arrests, intel and jail records. |
+| [dps-gangwars](https://github.com/DaemonAlex/dps-gangwars) | Ambient gang NPCs, territory population and war reinforcements. |
+| [dps-rotations](https://github.com/DaemonAlex/dps-rotations) | Moves dealers, harvests and other spots on a fixed schedule. |
+| [dps-trains](https://github.com/DaemonAlex/dps-trains) | The train system. Pairs with dps-trains-stock, dps-traintools and dps-transitapp. |
+| [dps-transitapp](https://github.com/DaemonAlex/dps-transitapp) | Live train arrival boards on the lb-phone. |
+| [dps-faceplant](https://github.com/DaemonAlex/dps-faceplant) | City help, reports and staff tools on the lb-phone and lb-tablet. |
+| [dps-chat](https://github.com/DaemonAlex/dps-chat) | A command box for voice-only servers. No chat feed. |
+| [dps-filmmode](https://github.com/DaemonAlex/dps-filmmode) | One key hides every HUD layer and gives a smooth free camera for recording. |
