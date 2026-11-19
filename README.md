@@ -301,6 +301,7 @@ Auto-detects and works with:
 
 ### Recent changes
 
+- **19 November 2026 (2.2.1). One owner per car.** A car the garage script has stored or impounded, or that dps-parking keeps, is not saved here and is not spawned at start; its record is removed. This stops the same car existing twice.
 - **12 November 2026.** README: what it is for, how it works alone and with paid scripts, other DPS scripts.
 - **31 October 2026.** Job lists updated after the Roxwood map and its departments left the server. `rpd`, `rcso`, `rfd`, `omc` and `rmc` are gone from `Config.BlacklistedJobs` and `Config.TowJobs`. The hospital job is `lsmc`.
 - **29 October 2026.** Helicopters and planes no longer persist. The flight script on the server owns aircraft, and keeping them in place fought its clean-up. Cars, bikes, boats, quads and trailers still persist.

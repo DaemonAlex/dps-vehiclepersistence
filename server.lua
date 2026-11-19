@@ -365,6 +365,45 @@ local function SaveVehicleToDB(vehicleData)
     return true
 end
 
+-- ---------- one owner per car (DPS 2026-11-19) ----------
+-- The garage script (jg-advancedgarages: in_garage, impound) decides where a car is. dps-parking keeps the cars a
+-- player parked on purpose. This resource keeps only what is left: cars that are out and not parked.
+local garageCols
+local function HasGarageColumns()
+    if garageCols == nil then
+        local ok, rows = pcall(function()
+            return MySQL.query.await("SHOW COLUMNS FROM player_vehicles WHERE Field IN ('in_garage', 'impound')")
+        end)
+        garageCols = ok and rows and #rows == 2 or false
+    end
+    return garageCols
+end
+
+local function HeldByParking(plate)
+    if GetResourceState('dps-parking') ~= 'started' then return false end
+    local ok, parked = pcall(function() return exports['dps-parking']:IsVehicleParked(plate) end)
+    return ok and parked == true
+end
+
+local function HeldByGarage(plate)
+    if not HasGarageColumns() then return false end
+    local ok, row = pcall(function()
+        return MySQL.scalar.await('SELECT 1 FROM player_vehicles WHERE plate = ? AND (in_garage <> 0 OR impound <> 0) LIMIT 1', { plate })
+    end)
+    return ok and row ~= nil
+end
+
+-- Plates another owner holds, for the start-up spawn: stored, impounded, or parked with dps-parking (state 3).
+local function PlatesHeldElsewhere()
+    local held = {}
+    if not HasGarageColumns() then return held end
+    local ok, rows = pcall(function()
+        return MySQL.query.await('SELECT plate FROM player_vehicles WHERE in_garage <> 0 OR impound <> 0 OR state = 3')
+    end)
+    for _, r in ipairs(ok and rows or {}) do held[(r.plate:gsub('%s', ''))] = true end
+    return held
+end
+
 -- Remove vehicle from database
 local function RemoveVehicleFromDB(plate)
     InvalidateLiveDriving(plate)
@@ -405,7 +444,13 @@ function SpawnPersistedVehicles()
     print('^3[dps-vehiclepersistence] Spawning ' .. #vehicles .. ' persisted vehicles...')
 
     local spawned = 0
+    local held = PlatesHeldElsewhere()
     for _, veh in ipairs(vehicles) do
+      if held[veh.plate] then
+        -- The garage or dps-parking has this car: spawning it here would make a second one.
+        MySQL.query('DELETE FROM dps_world_vehicles WHERE plate = ?', { veh.plate })
+        print('^3[dps-vehiclepersistence] ' .. veh.plate .. ' is in a garage, impounded or parked: not spawned, record removed')
+      else
         local coords = json.decode(veh.coords)
         local props = json.decode(veh.props or '{}')
         local vehType = SanitizeVehicleType(veh.vehicle_type)
@@ -468,6 +513,7 @@ function SpawnPersistedVehicles()
         end
 
         Wait(Config.SpawnDelay)
+      end
     end
 
     print('^2[dps-vehiclepersistence] Successfully spawned ' .. spawned .. '/' .. #vehicles .. ' vehicles')
@@ -547,6 +593,10 @@ local function ValidateVehiclePayload(src, vehicleData, useCache)
 
     -- Exclusion / lock guard (job vehicles, rentals, active tow/mechanic work)
     if jobVehicles[plate] or lockedVehicles[plate] then return nil end
+
+    -- One owner per car: not a car dps-parking keeps, and (on a real save) not a car the garage has.
+    if HeldByParking(plate) then return nil end
+    if not useCache and HeldByGarage(plate) then return nil end
 
     local model = vehicleData.model
     if type(model) ~= 'string' or #model == 0 or #model > 50 then return nil end
