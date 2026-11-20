@@ -301,6 +301,7 @@ Auto-detects and works with:
 
 ### Recent changes
 
+- **20 November 2026 (2.3.0).** The server proves every save. It finds the car by its network id, checks the plate on it and that the player is next to it, and reads the position from the car. The model comes from the owner's record (the spawn name) and the car on the street must be that model, so a plate can no longer be saved as a different car, a garaged car can no longer be saved onto the street, and addon cars and long names come back after a restart. A car driven but never parked is saved when its driver disconnects, and cars being driven are saved at a scheduled restart. The saved look stays available until the owner drives the car, and is only sent to players near it. Towing a car out of persistence needs the job, on duty, at the car. The vehicle limit no longer counts the car being re-parked.
 - **19 November 2026 (2.2.1). One owner per car.** A car the garage script has stored or impounded, or that dps-parking keeps, is not saved here and is not spawned at start; its record is removed. This stops the same car existing twice.
 - **12 November 2026.** README: what it is for, how it works alone and with paid scripts, other DPS scripts.
 - **31 October 2026.** Job lists updated after the Roxwood map and its departments left the server. `rpd`, `rcso`, `rfd`, `omc` and `rmc` are gone from `Config.BlacklistedJobs` and `Config.TowJobs`. The hospital job is `lsmc`.

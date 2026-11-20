@@ -184,7 +184,9 @@ end)
 
 -- Callback to check if player owns a vehicle
 lib.callback.register('dps-vehiclepersistence:checkOwnership', function(source, plate)
-    return Bridge.CheckVehicleOwnership(source, plate)
+    plate = SanitizePlate(plate)
+    if not plate then return false end
+    return OwnsPlate(source, plate)
 end)
 
 -- Initialize database table
@@ -313,10 +315,45 @@ local function CachedOwnership(source, identifier, plate)
     return owned
 end
 
+-- Ownership for the client-facing checks, always through the short cache.
+function OwnsPlate(source, plate)
+    return CachedOwnership(source, Bridge.GetIdentifier(source), plate)
+end
+
 -- May this client mutate persistence state for `plate`? (owns it, or is admin)
 local function ClientMayMutate(source, plate)
     if HasAdminPerms(source) then return true end
-    return Bridge.CheckVehicleOwnership(source, plate)
+    return OwnsPlate(source, plate)
+end
+
+-- ---------- the server proves the car itself (DPS 2026-11-20) ----------
+local modelCache = {}   -- plate -> { model = spawn name or false, t = os.time() }
+
+--- The spawn name on the owner's record, cached for a few minutes.
+local function OwnedModel(source, plate)
+    local hit = modelCache[plate]
+    if hit and os.time() - hit.t < 300 then return hit.model or nil end
+    local model = Bridge.GetOwnedVehicleModel(source, plate)
+    modelCache[plate] = { model = model or false, t = os.time() }
+    return model
+end
+
+local function trimPlate(text)
+    return (tostring(text or ''):gsub('^%s+', ''):gsub('%s+$', ''))
+end
+
+--- Find the real vehicle behind a save: it exists, it is a vehicle, it carries this plate and it is
+--- next to the player. Returns the entity or nil.
+local function ProveVehicle(source, netId, plate, reach)
+    netId = tonumber(netId)
+    if not netId or netId <= 0 or netId > 65535 then return nil end
+    local entity = NetworkGetEntityFromNetworkId(netId)
+    if not entity or entity == 0 or not DoesEntityExist(entity) or GetEntityType(entity) ~= 2 then return nil end
+    if trimPlate(GetVehicleNumberPlateText(entity)) ~= plate then return nil end
+    local ped = GetPlayerPed(source)
+    if not ped or ped == 0 then return nil end
+    if #(GetEntityCoords(ped) - GetEntityCoords(entity)) > (reach or Config.SaveReach or 30.0) then return nil end
+    return entity
 end
 
 -- Callback for client to check admin status
@@ -407,6 +444,7 @@ end
 -- Remove vehicle from database
 local function RemoveVehicleFromDB(plate)
     InvalidateLiveDriving(plate)
+    vehiclePropsQueue[plate] = nil
     MySQL.query('DELETE FROM dps_world_vehicles WHERE plate = ?', {plate})
     if Config.Debug then
         print('^1[dps-vehiclepersistence] Removed vehicle from DB: ' .. plate)
@@ -522,10 +560,22 @@ end
 -- When a player requests props for a nearby vehicle
 RegisterNetEvent('dps-vehiclepersistence:requestProps', function(plate)
     local src = source
+    plate = SanitizePlate(plate)
+    if not plate then return end
     if vehiclePropsQueue[plate] then
         local data = vehiclePropsQueue[plate]
+        -- Only for a player who is near the car, and not over and over
+        local entity = NetworkGetEntityFromNetworkId(data.netId)
+        local ped = GetPlayerPed(src)
+        if not entity or entity == 0 or not DoesEntityExist(entity) or not ped or ped == 0 then return end
+        if #(GetEntityCoords(ped) - GetEntityCoords(entity)) > (Config.PropsReach or 250.0) then return end
+        data.sent = data.sent or {}
+        if data.sent[src] and os.time() - data.sent[src] < 10 then return end
+        data.sent[src] = os.time()
+
+        -- The look stays queued until the owner drives or saves the car, so a client that failed
+        -- to apply it (or a cheat that asked first) cannot leave the car stock for everyone.
         TriggerClientEvent('dps-vehiclepersistence:applyProps', src, data.netId, data.props, data.fuel, data.body, data.engine)
-        vehiclePropsQueue[plate] = nil
 
         if worldVehicles[plate] then
             worldVehicles[plate].needsProps = false
@@ -556,9 +606,12 @@ RegisterNetEvent('dps-vehiclepersistence:vehicleEntered', function(netId, plate,
     if not plate then return end
 
     local isOwner = ClientMayMutate(src, plate)
+    -- The owner must really be at the car they say they got into
+    if isOwner and not ProveVehicle(src, netId, plate, 15.0) then return end
 
     -- If this is the owner's vehicle, track it
     if isOwner then
+        vehiclePropsQueue[plate] = nil   -- the owner has it now: nobody re-applies the saved look
         if not playerVehicles[identifier] then
             playerVehicles[identifier] = {}
         end
@@ -598,13 +651,28 @@ local function ValidateVehiclePayload(src, vehicleData, useCache)
     if HeldByParking(plate) then return nil end
     if not useCache and HeldByGarage(plate) then return nil end
 
-    local model = vehicleData.model
-    if type(model) ~= 'string' or #model == 0 or #model > 50 then return nil end
+    -- The car has to be real: this plate, on a vehicle, next to the player.
+    local entity = ProveVehicle(src, vehicleData.netId, plate)
+    if not entity then return nil end
+
+    -- The model comes from the owner's record (the spawn name), not from the player's game. The
+    -- display name the client used to send is wrong for addon cars and long names, so those cars
+    -- never came back. The car on the street must be that model.
+    local model = OwnedModel(src, plate)
+    if model then
+        if GetEntityModel(entity) ~= joaat(model) then return nil end
+    else
+        model = vehicleData.model
+        if type(model) ~= 'string' or #model == 0 or #model > 50 then return nil end
+        if GetEntityModel(entity) ~= joaat(model) then return nil end
+    end
 
     if IsBlacklisted(model) then return nil end
     if IsJobBlacklisted(identifier) then return nil end
 
-    local coords = ValidateCoords(vehicleData.coords)
+    -- Where it is and which way it faces are read from the car, on the server
+    local at = GetEntityCoords(entity)
+    local coords = ValidateCoords({ x = at.x, y = at.y, z = at.z })
     if not coords then return nil end
 
     local props = ValidateProps(vehicleData.props)
@@ -615,10 +683,10 @@ local function ValidateVehiclePayload(src, vehicleData, useCache)
         citizenid = identifier,      -- always server-derived
         identifier = identifier,
         model = model,
-        vehicleType = SanitizeVehicleType(vehicleData.vehicleType),
-        netId = vehicleData.netId,
+        vehicleType = SanitizeVehicleType(GetVehicleType(entity) or vehicleData.vehicleType),
+        netId = tonumber(vehicleData.netId),
         coords = coords,
-        heading = ClampNumber(vehicleData.heading, -360.0, 360.0, 0.0),
+        heading = ClampNumber(GetEntityHeading(entity), -360.0, 360.0, 0.0),
         props = props,
         fuel = ClampNumber(vehicleData.fuel, 0.0, 100.0, 100.0),
         body = ClampNumber(vehicleData.body, 0.0, 1000.0, 1000.0),
@@ -629,8 +697,8 @@ end
 -- Enforce MaxVehiclesPerPlayer by evicting the oldest tracked world vehicle for this owner.
 local function EnforceVehicleLimit(identifier, excludePlate)
     local count = 0
-    for _, veh in pairs(worldVehicles) do
-        if veh.identifier == identifier and not veh.beingDriven then
+    for plate, veh in pairs(worldVehicles) do
+        if veh.identifier == identifier and not veh.beingDriven and plate ~= excludePlate then
             count = count + 1
         end
     end
@@ -638,7 +706,7 @@ local function EnforceVehicleLimit(identifier, excludePlate)
     if count >= (Config.MaxVehiclesPerPlayer or 5) then
         local oldest, oldestTime = nil, math.huge
         for plate, veh in pairs(worldVehicles) do
-            if veh.identifier == identifier and plate ~= excludePlate then
+            if veh.identifier == identifier and plate ~= excludePlate and not veh.beingDriven then
                 local t = veh.savedAt or 0
                 if t < oldestTime then
                     oldest, oldestTime = plate, t
@@ -655,6 +723,8 @@ end
 -- Persist a validated payload to memory + DB (shared by exit-save and disconnect-save).
 local function PersistWorldVehicle(clean)
     EnforceVehicleLimit(clean.identifier, clean.plate)
+
+    vehiclePropsQueue[clean.plate] = nil   -- a fresh save replaces the look that was waiting
 
     worldVehicles[clean.plate] = {
         netId = clean.netId,
@@ -739,7 +809,10 @@ AddEventHandler('playerDropped', function(reason)
     -- Only flush a vehicle still tracked as a world vehicle; if it was stored,
     -- destroyed, towed or excluded since the payload was cached, re-persisting
     -- it would duplicate the car.
-    if live and not worldVehicles[live.plate] then
+    -- (Stored, destroyed, towed and excluded cars are dropped from liveDriving when that happens,
+    -- and the garage / parking check below catches the rest. A car that was only ever driven this
+    -- session, never parked, used to be thrown away here.)
+    if live and (jobVehicles[live.plate] or lockedVehicles[live.plate] or HeldByParking(live.plate) or HeldByGarage(live.plate)) then
         liveDriving[src] = nil
         live = nil
     end
@@ -812,6 +885,17 @@ RegisterNetEvent('dps-vehiclepersistence:towVehicle', function(plate)
         end
     end
     if not hasTowPerm then return end
+    if Bridge.IsOnDuty and not Bridge.IsOnDuty(src) then return end
+
+    -- At the car, not from across the map
+    local held = worldVehicles[plate]
+    if held then
+        local ent = held.entity
+        if (not ent or ent == 0 or not DoesEntityExist(ent)) and held.netId then ent = NetworkGetEntityFromNetworkId(held.netId) end
+        local ped = GetPlayerPed(src)
+        if ent and ent ~= 0 and DoesEntityExist(ent) and ped and ped ~= 0
+            and #(GetEntityCoords(ped) - GetEntityCoords(ent)) > 30.0 then return end
+    end
 
     if worldVehicles[plate] then
         RemoveVehicleFromDB(plate)
@@ -866,6 +950,14 @@ AddEventHandler('txAdmin:events:serverShuttingDown', function()
             SaveVehicleToDB(veh)
             saved = saved + 1
         end
+    end
+    -- Cars being driven right now: save where they were last seen
+    for src, live in pairs(liveDriving) do
+        if not HeldByParking(live.plate) then
+            SaveVehicleToDB(live)
+            saved = saved + 1
+        end
+        liveDriving[src] = nil
     end
 
     print('^2[dps-vehiclepersistence] Saved ' .. saved .. ' vehicles before shutdown')
@@ -1088,10 +1180,10 @@ AddStateBagChangeHandler('dps:damage', nil, function(bagName, key, value, reserv
     local plate = GetVehicleNumberPlateText(entity)
     plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
 
-    if worldVehicles[plate] and value then
-        -- Update tracked damage values
-        worldVehicles[plate].body = value.body
-        worldVehicles[plate].engine = value.engine
+    if worldVehicles[plate] and type(value) == 'table' then
+        -- Update tracked damage values (numbers only, inside the game's range)
+        worldVehicles[plate].body = ClampNumber(value.body, 0.0, 1000.0, worldVehicles[plate].body or 1000.0)
+        worldVehicles[plate].engine = ClampNumber(value.engine, -4000.0, 1000.0, worldVehicles[plate].engine or 1000.0)
 
         if Config.Debug then
             print('^3[dps-vehiclepersistence] Damage updated via state bag: ' .. plate)
