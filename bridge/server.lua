@@ -68,6 +68,17 @@ function Bridge.GetPlayerJob(source)
     return nil
 end
 
+--- On duty? Frameworks without a duty flag count as on duty.
+function Bridge.IsOnDuty(source)
+    local player = Bridge.GetPlayer(source)
+    if not player then return false end
+    if Bridge.Framework == 'qb' or Bridge.Framework == 'qbx' then
+        local job = player.PlayerData and player.PlayerData.job
+        return job ~= nil and job.onduty == true
+    end
+    return true
+end
+
 function Bridge.GetPermissionGroup(source)
     if Bridge.Framework == 'qbx' then
         -- qbx has no GetPermission(); admin status is resolved via ACE by the caller.
@@ -125,6 +136,17 @@ function Bridge.CheckVehicleOwnership(source, plate)
         return result[1][column] == identifier
     end
     return false
+end
+
+--- The spawn name the owner's record holds for this plate (qb / qbx: player_vehicles.vehicle).
+--- nil when the framework does not keep one in a plain column, or the player does not own the plate.
+function Bridge.GetOwnedVehicleModel(source, plate)
+    local identifier = Bridge.GetIdentifier(source)
+    if not identifier or type(plate) ~= 'string' or plate == '' then return nil end
+    if Bridge.Framework ~= 'qb' and Bridge.Framework ~= 'qbx' then return nil end
+    local row = MySQL.single.await('SELECT vehicle FROM player_vehicles WHERE citizenid = ? AND (plate = ? OR TRIM(plate) = ?) LIMIT 1',
+        { identifier, plate, plate })
+    return row and type(row.vehicle) == 'string' and row.vehicle ~= '' and row.vehicle or nil
 end
 
 -- ═══════════════════════════════════════════════════════
